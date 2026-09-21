@@ -5,8 +5,6 @@ use std::slice::Iter;
 pub enum FileType {
     #[enum_value(name = "PNG")]
     Png,
-    #[enum_value(name = "JPEG")]
-    Jpeg,
     #[enum_value(name = "JPG")]
     Jpg,
     #[enum_value(name = "WEBP")]
@@ -39,27 +37,14 @@ pub enum FileType {
 }
 
 use FileType::{
-    Avif, Bmp, Dds, Gif, Heic, Heif, Ico, Jpeg, Jpg, Jxl, Pdf, Png, Svg, Tiff, Unknown, Webp,
+    Avif, Bmp, Dds, Gif, Heic, Heif, Ico, Jpg, Jxl, Pdf, Png, Svg, Tiff, Unknown, Webp,
 };
 
 impl FileType {
     pub const fn is_input(self) -> bool {
         matches!(
             self,
-            Png | Jpg
-                | Webp
-                | Svg
-                | Heif
-                | Heic
-                | Bmp
-                | Avif
-                | Jxl
-                | Tiff
-                | Pdf
-                | Gif
-                | Ico
-                | Jpeg
-                | Dds
+            Png | Jpg | Webp | Svg | Heif | Heic | Bmp | Avif | Jxl | Tiff | Pdf | Gif | Ico | Dds
         )
     }
 
@@ -70,7 +55,7 @@ impl FileType {
     pub const fn is_lossy(self) -> bool {
         matches!(
             self,
-            Jpg | Jpeg | Webp | Heif | Heic | Avif | Jxl | Tiff | Pdf | Dds
+            Jpg | Webp | Heif | Heic | Avif | Jxl | Tiff | Pdf | Dds
         )
     }
 
@@ -84,7 +69,7 @@ impl FileType {
     pub const fn supports_metadata(self) -> bool {
         matches!(
             self,
-            Png | Jpg | Jpeg | Jxl | Tiff | Pdf | Svg | Gif | Webp | Heif | Heic | Avif | Bmp
+            Png | Jpg | Jxl | Tiff | Pdf | Svg | Gif | Webp | Heif | Heic | Avif | Bmp
         )
     }
 
@@ -95,20 +80,20 @@ impl FileType {
     pub const fn is_output(self) -> bool {
         matches!(
             self,
-            Png | Jpg | Jpeg | Webp | Heif | Heic | Bmp | Avif | Jxl | Tiff | Pdf | Gif | Ico | Dds
+            Png | Jpg | Webp | Heif | Heic | Bmp | Avif | Jxl | Tiff | Pdf | Gif | Ico | Dds
         )
     }
 
     pub fn iterator() -> Iter<'static, Self> {
-        static FILETYPES: [FileType; 15] = [
-            Png, Jpg, Jpeg, Webp, Svg, Heif, Heic, Bmp, Avif, Jxl, Tiff, Pdf, Gif, Ico, Dds,
+        static FILETYPES: [FileType; 14] = [
+            Png, Jpg, Webp, Svg, Heif, Heic, Bmp, Avif, Jxl, Tiff, Pdf, Gif, Ico, Dds,
         ];
         FILETYPES.iter()
     }
 
     pub fn input_formats() -> Iter<'static, Self> {
-        static FILETYPES: [FileType; 15] = [
-            Png, Jpg, Jpeg, Webp, Svg, Heif, Heic, Bmp, Avif, Jxl, Tiff, Pdf, Gif, Ico, Dds,
+        static FILETYPES: [FileType; 14] = [
+            Png, Jpg, Webp, Svg, Heif, Heic, Bmp, Avif, Jxl, Tiff, Pdf, Gif, Ico, Dds,
         ];
         FILETYPES.iter()
     }
@@ -124,7 +109,7 @@ impl FileType {
     pub const fn as_mime(self) -> &'static str {
         match self {
             Png => "image/png",
-            Jpg | Jpeg => "image/jpeg",
+            Jpg => "image/jpeg",
             Webp => "image/webp",
             Svg => "image/svg+xml",
             Heif => "image/heif",
@@ -165,7 +150,6 @@ impl FileType {
         match self {
             Png => "png",
             Jpg => "jpg",
-            Jpeg => "jpeg",
             Webp => "webp",
             Svg => "svg",
             Heif => "heif",
