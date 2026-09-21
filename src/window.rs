@@ -41,17 +41,17 @@ enum ArcOrOptionError {
 
 #[allow(dead_code)]
 impl ResizeFilter {
-    pub fn as_display_string(&self) -> Option<&str> {
+    pub const fn as_display_string(&self) -> Option<&str> {
         match self {
-            ResizeFilter::Default => None,
-            ResizeFilter::Point => Some("Point"),
+            Self::Default => None,
+            Self::Point => Some("Point"),
         }
     }
 
-    pub fn from_index(index: usize) -> Option<Self> {
+    pub const fn from_index(index: usize) -> Option<Self> {
         match index {
-            0 => Some(ResizeFilter::Default),
-            1 => Some(ResizeFilter::Point),
+            0 => Some(Self::Default),
+            1 => Some(Self::Point),
             _ => None,
         }
     }
@@ -64,10 +64,10 @@ enum ResizeType {
 }
 
 impl ResizeType {
-    pub fn from_index(index: usize) -> Option<Self> {
+    pub const fn from_index(index: usize) -> Option<Self> {
         match index {
-            0 => Some(ResizeType::Percentage),
-            1 => Some(ResizeType::ExactPixels),
+            0 => Some(Self::Percentage),
+            1 => Some(Self::ExactPixels),
             _ => None,
         }
     }
@@ -236,12 +236,12 @@ mod imp {
                 dbg!("Failed to save window state, {}", &err);
             }
 
-            if !self.is_canceled.load(std::sync::atomic::Ordering::SeqCst) {
-                self.obj().close_dialog();
-                glib::Propagation::Stop
-            } else {
+            if self.is_canceled.load(std::sync::atomic::Ordering::SeqCst) {
                 // Pass close request on to the parent
                 self.parent_close_request()
+            } else {
+                self.obj().close_dialog();
+                glib::Propagation::Stop
             }
         }
     }
@@ -592,7 +592,7 @@ impl AppWindow {
                         let mut current_jobs = this.imp().current_jobs.borrow_mut();
                         for x in current_jobs.iter() {
                             match x.kill() {
-                                Ok(_) => {}
+                                Ok(()) => {}
                                 Err(_) => {
                                     x.wait().ok();
                                 }
@@ -648,7 +648,7 @@ impl AppWindow {
                     let t = clipboard.read_text_future().await.unwrap().unwrap();
                     let files = t
                         .lines()
-                        .flat_map(|p| InputFile::new(&gio::File::for_path(p)))
+                        .filter_map(|p| InputFile::new(&gio::File::for_path(p)))
                         .collect();
                     this.open_success(files);
                 }
@@ -658,12 +658,15 @@ impl AppWindow {
 
     fn open_success(&self, mut files: Vec<InputFile>) {
         let prev_files = self.active_files();
-        let prev_files_paths = prev_files.iter().map(|f| f.path()).collect_vec();
+        let prev_files_paths = prev_files
+            .iter()
+            .map(super::input_file::InputFile::path)
+            .collect_vec();
         files = files
             .into_iter()
             .filter(|f| !prev_files_paths.contains(&f.path()))
             .chain(prev_files)
-            .filter(|f| f.exists())
+            .filter(super::input_file::InputFile::exists)
             .collect();
 
         self.imp().input_file_store.remove_all();
@@ -671,7 +674,7 @@ impl AppWindow {
 
         self.switch_to_stack_loading_generally();
 
-        for file in files.iter() {
+        for file in &files {
             self.imp().input_file_store.append(file);
         }
 
@@ -682,7 +685,10 @@ impl AppWindow {
 
     fn load_frames(&self) {
         let files = self.files();
-        let file_paths = files.iter().map(|f| f.path()).collect_vec();
+        let file_paths = files
+            .iter()
+            .map(super::input_file::InputFile::path)
+            .collect_vec();
 
         let (sender, receiver) = async_channel::bounded(1);
 
@@ -851,22 +857,22 @@ impl AppWindow {
     }
 
     fn selected_output(&self) -> Option<FileType> {
-        match self.imp().output_filetype.selected_item() {
-            Some(o) => match o.downcast::<gtk::StringObject>() {
-                Ok(o) => Some(FileType::from_string(&o.string().as_str().to_lowercase()).unwrap()),
-                Err(_) => None,
-            },
-            None => None,
-        }
+        self.imp().output_filetype.selected_item().and_then(|o| {
+            o.downcast::<gtk::StringObject>().map_or(None, |o| {
+                Some(FileType::from_string(&o.string().as_str().to_lowercase()).unwrap())
+            })
+        })
     }
 
     fn selected_compression(&self) -> Option<CompressionType> {
-        match self.imp().output_compression.is_visible() {
-            true => match self.imp().output_compression_value.is_active() {
-                true => Some(CompressionType::Zip),
-                false => Some(CompressionType::Directory),
-            },
-            false => None,
+        if self.imp().output_compression.is_visible() {
+            if self.imp().output_compression_value.is_active() {
+                Some(CompressionType::Zip)
+            } else {
+                Some(CompressionType::Directory)
+            }
+        } else {
+            None
         }
     }
 
@@ -881,8 +887,7 @@ impl AppWindow {
             .iter()
             .map(|f| {
                 (
-                    f.kind().supports_pixbuf()
-                        && f.area().map(|x| x < 2000 * 2000).unwrap_or_default(), // image isn't too big
+                    f.kind().supports_pixbuf() && f.area().is_some_and(|x| x < 2000 * 2000), // image isn't too big
                     f.path(),
                 )
             })
@@ -911,9 +916,10 @@ impl AppWindow {
                         sender
                             .send_blocking((
                                 image_index,
-                                match should_load_thumbnail {
-                                    true => Some(Texture::from_filename(&path)),
-                                    false => None,
+                                if should_load_thumbnail {
+                                    Some(Texture::from_filename(&path))
+                                } else {
+                                    None
                                 },
                             ))
                             .expect("Concurrency Issues");
@@ -953,7 +959,7 @@ impl AppWindow {
     }
 
     fn convert_start(&self, save_format: OutputType, path: String) {
-        use FileType::*;
+        use FileType::Pdf;
 
         self.imp().convert_button.set_sensitive(false);
         self.imp().progress_bar.set_text(Some(&gettext("Loading…")));
@@ -1047,7 +1053,7 @@ impl AppWindow {
         let output_files = job_input
             .iter()
             .map(|(_, _, o)| {
-                get_temp_file_path(&dir, JobFile::new(output_type, Some(o.to_string())))
+                get_temp_file_path(&dir, &JobFile::new(output_type, Some(o.clone())))
                     .to_str()
                     .unwrap()
                     .to_owned()
@@ -1057,8 +1063,8 @@ impl AppWindow {
         dbg!(&output_files);
 
         let magick_arguments = MagickConvertJob {
-            input_file: "".to_string(),
-            output_file: "".to_string(),
+            input_file: String::new(),
+            output_file: String::new(),
             background: self.get_bgcolor_argument(),
             quality: self.get_quality_argument(),
             filter: self.get_filter_argument(),
@@ -1074,11 +1080,11 @@ impl AppWindow {
             .map(|(f, ft, os)| {
                 generate_job(
                     &f,
-                    &ft,
-                    get_temp_file_path(&dir, JobFile::new(output_type, Some(os)))
+                    ft,
+                    get_temp_file_path(&dir, &JobFile::new(output_type, Some(os)))
                         .to_str()
                         .unwrap(),
-                    &output_type,
+                    output_type,
                     self.get_dpi_argument(),
                     &magick_arguments,
                 )
@@ -1087,7 +1093,7 @@ impl AppWindow {
 
         let (sender, receiver) = async_channel::bounded(1);
 
-        let count = magick_jobs.iter().map(|mjs| mjs.len()).sum();
+        let count = magick_jobs.iter().map(std::vec::Vec::len).sum();
 
         let completed = std::sync::Arc::new(AtomicUsize::new(0));
 
@@ -1130,7 +1136,7 @@ impl AppWindow {
                             sender
                                 .send_blocking(ArcOrOptionError::Child(child_arc.clone()))
                                 .expect("Concurrency Issues");
-                            let output = wait_for_child(child_arc.clone()).err();
+                            let output = wait_for_child(&child_arc).err();
                             if stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
                                 return;
                             }
@@ -1161,7 +1167,7 @@ impl AppWindow {
                         ArcOrOptionError::Child(c) => {
                             if stop_flag_r.load(std::sync::atomic::Ordering::SeqCst) {
                                 match c.kill() {
-                                    Ok(_) => {}
+                                    Ok(()) => {}
                                     Err(_) => {
                                         c.wait().ok();
                                     }
@@ -1188,7 +1194,7 @@ impl AppWindow {
                                 break;
                             }
                         }
-                    };
+                    }
                 }
             }
         ));
@@ -1313,7 +1319,7 @@ impl ConvertOperations for AppWindow {
 
                     sender
                         .send_blocking(ArcOrOptionError::OptionError(
-                            wait_for_child(child_arc).err(),
+                            wait_for_child(&child_arc).err(),
                         ))
                         .expect("Concurrency Issues");
                 });
@@ -1358,7 +1364,7 @@ impl ConvertOperations for AppWindow {
 
                 receiver
             }
-            _ => {
+            OutputType::Compression(CompressionType::Zip) => {
                 let (sender, receiver) = async_channel::bounded(1);
 
                 std::thread::spawn(move || {
@@ -1389,7 +1395,7 @@ impl ConvertOperations for AppWindow {
 
                     sender
                         .send_blocking(ArcOrOptionError::OptionError(
-                            wait_for_child(child_arc).err(),
+                            wait_for_child(&child_arc).err(),
                         ))
                         .expect("Concurrency Issues");
                 });
@@ -1411,7 +1417,7 @@ impl ConvertOperations for AppWindow {
                                 .load(std::sync::atomic::Ordering::SeqCst)
                             {
                                 match c.kill() {
-                                    Ok(_) => {}
+                                    Ok(()) => {}
                                     Err(_) => {
                                         c.wait().ok();
                                     }
@@ -1431,7 +1437,7 @@ impl ConvertOperations for AppWindow {
                             }
                             break;
                         }
-                    };
+                    }
                 }
             }
         ));
@@ -1452,7 +1458,7 @@ impl ConvertOperations for AppWindow {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         for x in current_jobs.iter() {
             match x.kill() {
-                Ok(_) => {}
+                Ok(()) => {}
                 Err(_) => {
                     x.wait().ok();
                 }
@@ -1564,7 +1570,7 @@ impl ConvertOperations for AppWindow {
                         let mut current_jobs = this.imp().current_jobs.borrow_mut();
                         for x in current_jobs.iter() {
                             match x.kill() {
-                                Ok(_) => {}
+                                Ok(()) => {}
                                 Err(_) => {
                                     x.wait().ok();
                                 }
@@ -1588,9 +1594,10 @@ impl ConvertArguments for AppWindow {
     }
 
     fn get_strip_argument(&self) -> StripType {
-        match self.imp().strip.is_active() {
-            true => StripType::StripAll,
-            false => StripType::None,
+        if self.imp().strip.is_active() {
+            StripType::StripAll
+        } else {
+            StripType::None
         }
     }
 
@@ -1603,9 +1610,10 @@ impl ConvertArguments for AppWindow {
     }
 
     fn get_filter_argument(&self) -> Option<ResizeFilter> {
-        match self.imp().resize_filter_default.is_active() {
-            true => Some(ResizeFilter::Default),
-            false => Some(ResizeFilter::Point),
+        if self.imp().resize_filter_default.is_active() {
+            Some(ResizeFilter::Default)
+        } else {
+            Some(ResizeFilter::Point)
         }
     }
 
@@ -1658,11 +1666,11 @@ impl WindowUI for AppWindow {
     fn update_output_options(&self) {
         let previous_option = self
             .selected_output()
-            .unwrap_or(self.load_selected_output());
+            .unwrap_or_else(|| self.load_selected_output());
 
         let new_options = gtk::StringList::new(&[]);
         let new_list = FileType::output_formats().collect_vec();
-        for ft in new_list.iter() {
+        for ft in &new_list {
             new_options.append(&ft.as_display_string());
         }
         self.imp().output_filetype.set_model(Some(&new_options));
@@ -1685,7 +1693,7 @@ impl WindowUI for AppWindow {
         if multiple_files || multiple_frames && !output_option.supports_animation() {
             let previous_option = self
                 .selected_compression()
-                .unwrap_or(self.load_selected_compression());
+                .unwrap_or_else(|| self.load_selected_compression());
 
             let pdf_selected = matches!(output_option, FileType::Pdf);
             self.imp().single_pdf.set_visible(pdf_selected);
@@ -1698,7 +1706,7 @@ impl WindowUI for AppWindow {
 
             match previous_option {
                 CompressionType::Zip => self.imp().output_compression_value.set_active(true),
-                _ => self.imp().output_compression_value.set_active(false),
+                CompressionType::Directory => self.imp().output_compression_value.set_active(false),
             }
         } else {
             self.imp().output_compression.set_visible(false);
@@ -1710,7 +1718,10 @@ impl WindowUI for AppWindow {
         let imp = self.imp();
 
         let input_files = self.active_files();
-        let input_filetypes: Vec<FileType> = input_files.iter().map(|inf| inf.kind()).collect();
+        let input_filetypes: Vec<FileType> = input_files
+            .iter()
+            .map(super::input_file::InputFile::kind)
+            .collect();
         let Some(output_filetype) =
             FileType::output_formats().nth(imp.output_filetype.selected() as usize)
         else {
@@ -1728,7 +1739,8 @@ impl WindowUI for AppWindow {
 
         if input_filetypes
             .iter()
-            .any(|input_file| input_file.supports_alpha())
+            .copied()
+            .any(super::filetypes::FileType::supports_alpha)
         {
             imp.bgcolor_row.set_visible(true);
 
@@ -1738,7 +1750,7 @@ impl WindowUI for AppWindow {
                         .red(0.00)
                         .green(0.0)
                         .blue(0.0)
-                        .alpha(0.0000001)
+                        .alpha(0.000_000_1)
                         .build(),
                 );
                 let color_dialog = imp.bgcolor.dialog().unwrap();
@@ -1765,7 +1777,8 @@ impl WindowUI for AppWindow {
 
         if input_filetypes
             .iter()
-            .any(|input_file| input_file.supports_metadata())
+            .copied()
+            .any(super::filetypes::FileType::supports_metadata)
         {
             imp.strip_row.set_visible(true);
         }
@@ -1886,9 +1899,9 @@ impl WindowUI for AppWindow {
         {
             let caption = match dimensions {
                 Some((w, h)) => {
-                    format!("{} · {}×{}", file_type.as_display_string(), w, h,)
+                    format!("{} · {}×{}", file_type.as_display_string(), w, h)
                 }
-                None => file_type.as_display_string().to_owned(),
+                None => file_type.as_display_string().clone(),
             };
 
             let (w, h) = dimensions.unwrap_or_default();
@@ -1935,43 +1948,36 @@ impl WindowUI for AppWindow {
         for (index, (input_file, file_type, dimensions)) in
             input_files.into_iter().take(count).enumerate()
         {
-            match removed.contains(&(index as u32)) {
-                false => {
-                    let caption = match dimensions {
-                        Some((w, h)) => {
-                            format!("{} · {}×{}", file_type.as_display_string(), w, h,)
-                        }
-                        None => file_type.as_display_string().to_owned(),
-                    };
+            if removed.contains(&(index as u32)) {
+                imp.image_container.append(&gtk::FlowBoxChild::new());
+            } else {
+                let caption = match dimensions {
+                    Some((w, h)) => {
+                        format!("{} · {}×{}", file_type.as_display_string(), w, h)
+                    }
+                    None => file_type.as_display_string().clone(),
+                };
 
-                    let (w, h) = dimensions.unwrap_or_default();
+                let (w, h) = dimensions.unwrap_or_default();
 
-                    let image_thumbnail = ImageThumbnail::new(
-                        input_file.pixbuf().as_ref(),
-                        &caption,
-                        w as u32,
-                        h as u32,
-                    );
+                let image_thumbnail =
+                    ImageThumbnail::new(input_file.pixbuf().as_ref(), &caption, w as u32, h as u32);
 
-                    let image_flow_box_child = gtk::FlowBoxChild::new();
-                    image_flow_box_child.set_child(Some(&image_thumbnail));
+                let image_flow_box_child = gtk::FlowBoxChild::new();
+                image_flow_box_child.set_child(Some(&image_thumbnail));
 
-                    image_flow_box_child.update_property(&[Property::Label(&caption)]);
+                image_flow_box_child.update_property(&[Property::Label(&caption)]);
 
-                    imp.image_container.append(&image_flow_box_child);
-                    image_thumbnail.connect_remove_clicked(clone!(
-                        #[weak(rename_to=this)]
-                        self,
-                        move |_| {
-                            this.remove_file(index as u32);
-                            this.imp().image_container.invalidate_filter();
-                            this.imp().full_image_container.invalidate_filter();
-                        }
-                    ));
-                }
-                true => {
-                    imp.image_container.append(&gtk::FlowBoxChild::new());
-                }
+                imp.image_container.append(&image_flow_box_child);
+                image_thumbnail.connect_remove_clicked(clone!(
+                    #[weak(rename_to=this)]
+                    self,
+                    move |_| {
+                        this.remove_file(index as u32);
+                        this.imp().image_container.invalidate_filter();
+                        this.imp().full_image_container.invalidate_filter();
+                    }
+                ));
             }
         }
 
@@ -2110,7 +2116,8 @@ impl SettingsStore for AppWindow {
     fn load_options(&self) {
         let imp = self.imp();
 
-        imp.quality.set_value(imp.settings.int("quality") as f64);
+        imp.quality
+            .set_value(f64::from(imp.settings.int("quality")));
         imp.dpi_value.set_text(&imp.settings.int("dpi").to_string());
         imp.resize_type
             .set_selected(imp.settings.enum_("resize-type") as u32);
@@ -2215,21 +2222,21 @@ impl FileOperations for AppWindow {
             .unwrap()
             .to_owned();
 
-        if save_format != OutputType::Compression(CompressionType::Directory) {
+        if save_format == OutputType::Compression(CompressionType::Directory) {
+            FileChooser::choose_output_folder_wrapper(
+                self,
+                default_folder,
+                Self::convert_start_wrapper,
+                Self::save_error,
+            );
+        } else {
             FileChooser::choose_output_file_wrapper(
                 self,
                 format!("{default_name}.{}", save_format.as_extension()),
                 save_format,
                 default_folder,
-                AppWindow::convert_start_wrapper,
-                AppWindow::save_error,
-            );
-        } else {
-            FileChooser::choose_output_folder_wrapper(
-                self,
-                default_folder,
-                AppWindow::convert_start_wrapper,
-                AppWindow::save_error,
+                Self::convert_start_wrapper,
+                Self::save_error,
             );
         }
     }
@@ -2238,9 +2245,9 @@ impl FileOperations for AppWindow {
         FileChooser::open_files_wrapper(
             self,
             vec![],
-            AppWindow::open_load,
-            AppWindow::add_success_wrapper,
-            AppWindow::open_error,
+            Self::open_load,
+            Self::add_success_wrapper,
+            Self::open_error,
         );
     }
 
@@ -2263,19 +2270,18 @@ impl FileOperations for AppWindow {
 /// Move a file, falling back to copy + delete when source and destination live
 /// on different filesystems (where [`std::fs::rename`] fails with `EXDEV`).
 fn move_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    match std::fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            std::fs::copy(from, to)?;
-            std::fs::remove_file(from)
-        }
+    if matches!(std::fs::rename(from, to), Ok(())) {
+        Ok(())
+    } else {
+        std::fs::copy(from, to)?;
+        std::fs::remove_file(from)
     }
 }
 
 fn generate_width_from_height(height: u32, image_dim: (u32, u32)) -> u32 {
-    ((height as f64) * (image_dim.0 as f64) / (image_dim.1 as f64)).round() as u32
+    (f64::from(height) * f64::from(image_dim.0) / f64::from(image_dim.1)).round() as u32
 }
 
 fn generate_height_from_width(width: u32, image_dim: (u32, u32)) -> u32 {
-    ((width as f64) * (image_dim.1 as f64) / (image_dim.0 as f64)).round() as u32
+    (f64::from(width) * f64::from(image_dim.1) / f64::from(image_dim.0)).round() as u32
 }

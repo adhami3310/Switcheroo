@@ -5,7 +5,6 @@ use gtk::{
     prelude::*,
     subclass::prelude::*,
 };
-use once_cell::sync::Lazy;
 use std::cell::{Cell, Ref, RefCell};
 use std::num::NonZeroUsize;
 
@@ -47,20 +46,21 @@ mod imp {
 
     impl ObjectImpl for InputFile {
         fn properties() -> &'static [ParamSpec] {
-            static PROPERTIES: Lazy<Vec<ParamSpec>> = Lazy::new(|| {
-                vec![
-                    ParamSpecString::builder("path").readwrite().build(),
-                    ParamSpecEnum::builder::<FileType>("kind")
-                        .readwrite()
-                        .build(),
-                    ParamSpecObject::builder::<Pixbuf>("pixbuf")
-                        .write_only()
-                        .build(),
-                    ParamSpecBoolean::builder("is-behind-sandbox")
-                        .readwrite()
-                        .build(),
-                ]
-            });
+            static PROPERTIES: std::sync::LazyLock<Vec<ParamSpec>> =
+                std::sync::LazyLock::new(|| {
+                    vec![
+                        ParamSpecString::builder("path").readwrite().build(),
+                        ParamSpecEnum::builder::<FileType>("kind")
+                            .readwrite()
+                            .build(),
+                        ParamSpecObject::builder::<Pixbuf>("pixbuf")
+                            .write_only()
+                            .build(),
+                        ParamSpecBoolean::builder("is-behind-sandbox")
+                            .readwrite()
+                            .build(),
+                    ]
+                });
             PROPERTIES.as_ref()
         }
 
@@ -155,7 +155,7 @@ impl InputFile {
 
     pub fn dimensions(&self) -> Option<(usize, usize)> {
         let (w, h) = (self.width(), self.height());
-        w.and_then(|w| h.map(|h| (w, h)))
+        w.zip(h)
     }
 
     pub fn set_frame_count(&self, frame_count: NonZeroUsize) {

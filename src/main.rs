@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 use gettextrs::{LocaleCategory, gettext};
 use glib::ExitCode;
 use gtk::{gio, glib};
+use log::warn;
 use tokio::runtime::Runtime;
 
 use self::application::App;
@@ -33,14 +34,25 @@ fn runtime() -> &'static Runtime {
 
 const ZIP_BINARY_NAME: &str = "zip";
 
+/// # Safety
+///
+/// This function calls `setlocale()`, which is not thread-safe. It should be called before any threads are spawned or POSIX signals are enabled.
+unsafe fn setup_i18n() -> Result<(), std::io::Error> {
+    unsafe {
+        gettextrs::setlocale(LocaleCategory::LcAll, "");
+    }
+    gettextrs::bindtextdomain(GETTEXT_PACKAGE, LOCALEDIR)?;
+    gettextrs::textdomain(GETTEXT_PACKAGE)?;
+    Ok(())
+}
+
 fn main() -> ExitCode {
     // Initialize logger
     pretty_env_logger::init();
 
-    // Prepare i18n
-    gettextrs::setlocale(LocaleCategory::LcAll, "");
-    gettextrs::bindtextdomain(GETTEXT_PACKAGE, LOCALEDIR).expect("Unable to bind the text domain");
-    gettextrs::textdomain(GETTEXT_PACKAGE).expect("Unable to switch to the text domain");
+    if let Err(err) = unsafe { setup_i18n() } {
+        warn!("Failed to set up internationalization: {err}");
+    }
 
     glib::set_application_name(&gettext("Switcheroo"));
 

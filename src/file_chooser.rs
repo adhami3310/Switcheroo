@@ -58,7 +58,7 @@ impl FileChooser {
             #[strong]
             parent,
             async move {
-                FileChooser::open_files(
+                Self::open_files(
                     &parent,
                     current_paths,
                     callback_start,
@@ -110,7 +110,7 @@ impl FileChooser {
             return;
         }
 
-        FileChooser::load_files(
+        Self::load_files(
             files,
             parent,
             &callback_start,
@@ -134,7 +134,7 @@ impl FileChooser {
             #[strong]
             parent,
             async move {
-                FileChooser::choose_output_file(
+                Self::choose_output_file(
                     &parent,
                     default_name,
                     format,
@@ -209,7 +209,7 @@ impl FileChooser {
             #[strong]
             parent,
             async move {
-                FileChooser::choose_output_folder(
+                Self::choose_output_folder(
                     &parent,
                     Some(default_folder),
                     callback_success,

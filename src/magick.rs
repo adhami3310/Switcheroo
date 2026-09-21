@@ -1,6 +1,7 @@
 use crate::{color::Color, filetypes::FileType, window::ResizeFilter, window::StripType};
 use gettextrs::gettext;
 use itertools::Itertools;
+use log::error;
 use shared_child::SharedChild;
 use std::io::Read;
 use std::num::NonZeroUsize;
@@ -34,7 +35,7 @@ pub async fn count_frames(path: String) -> Result<(NonZeroUsize, Option<(usize, 
                 .as_str()
                 .trim()
                 .split('x')
-                .map(|n| n.parse::<usize>())
+                .map(str::parse::<usize>)
                 .collect_vec();
             match dimensions[..] {
                 [Ok(width), Ok(height)] => Some((width, height)),
@@ -65,18 +66,18 @@ impl Default for ResizeArgument {
 
 impl MagickArgument for ResizeFilter {
     fn get_argument(&self) -> Vec<String> {
-        match self.as_display_string() {
-            Some(x) => vec!["-filter".to_string(), x.to_owned()],
-            None => vec![],
-        }
+        self.as_display_string()
+            .map_or_else(std::vec::Vec::new, |f| {
+                vec!["-filter".to_string(), f.to_owned()]
+            })
     }
 }
 
 impl MagickArgument for StripType {
     fn get_argument(&self) -> Vec<String> {
         match self {
-            StripType::StripAll => vec!["-auto-orient".to_string(), "-strip".to_string()],
-            StripType::None => vec![],
+            Self::StripAll => vec!["-auto-orient".to_string(), "-strip".to_string()],
+            Self::None => vec![],
         }
     }
 }
@@ -84,10 +85,10 @@ impl MagickArgument for StripType {
 impl MagickArgument for ResizeArgument {
     fn get_argument(&self) -> Vec<String> {
         match self {
-            ResizeArgument::Percentage { width, height } => {
+            Self::Percentage { width, height } => {
                 vec!["-resize".to_owned(), format!("{width}%x{height}%")]
             }
-            ResizeArgument::ExactPixels { width, height } => {
+            Self::ExactPixels { width, height } => {
                 vec!["-resize".to_owned(), format!("{width}x{height}!")]
             }
         }
@@ -99,10 +100,8 @@ where
     T: MagickArgument,
 {
     fn get_argument(&self) -> Vec<String> {
-        match self {
-            Some(t) => t.get_argument(),
-            None => vec![],
-        }
+        self.as_ref()
+            .map_or_else(std::vec::Vec::new, MagickArgument::get_argument)
     }
 }
 
@@ -149,14 +148,16 @@ impl JobFile {
     }
 
     pub fn as_filename(&self) -> String {
-        match &self.desired_name {
-            Some(desired_name) => desired_name.to_owned(),
-            None => format!(
-                "TEMPORARY_SWITCHEROO_{}.{}",
-                self.id,
-                self.file_extension.as_extension()
-            ),
-        }
+        self.desired_name.as_ref().map_or_else(
+            || {
+                format!(
+                    "TEMPORARY_SWITCHEROO_{}.{}",
+                    self.id,
+                    self.file_extension.as_extension()
+                )
+            },
+            std::borrow::ToOwned::to_owned,
+        )
     }
 }
 
@@ -171,7 +172,7 @@ impl MagickConvertJob {
             .rsplit('.')
             .next()
             .unwrap_or("")
-            .split("[")
+            .split('[')
             .next()
             .unwrap_or("")
             .to_lowercase();
@@ -194,11 +195,9 @@ impl MagickConvertJob {
             ),
             "pdf" => (
                 self.resize_arg.get_argument(),
-                if let Some(density) = self.density {
+                self.density.map_or_else(std::vec::Vec::new, |density| {
                     vec!["-density".to_owned(), density.to_string()]
-                } else {
-                    vec![]
-                },
+                }),
             ),
             _ => (self.resize_arg.get_argument(), vec![]),
         };
@@ -247,13 +246,13 @@ impl MagickConvertJob {
 
 pub fn generate_job(
     input_path: &str,
-    input_type: &FileType,
+    input_type: FileType,
     output_path: &str,
-    output_type: &FileType,
+    output_type: FileType,
     pdf_dpi: usize,
     default_arguments: &MagickConvertJob,
 ) -> Vec<MagickConvertJob> {
-    use FileType::*;
+    use FileType::Pdf;
     match (input_type, output_type) {
         (Pdf, _) => std::iter::once(MagickConvertJob {
             input_file: input_path.to_owned(),
@@ -282,12 +281,13 @@ pub fn generate_job(
     }
 }
 
-pub fn wait_for_child(child: std::sync::Arc<SharedChild>) -> Result<(), String> {
+pub fn wait_for_child(child: &std::sync::Arc<SharedChild>) -> Result<(), String> {
     let command = child.wait();
     match command {
-        Ok(output) => match output.success() {
-            true => Ok(()),
-            false => {
+        Ok(output) => {
+            if output.success() {
+                Ok(())
+            } else {
                 let mut stderr = String::new();
                 child
                     .take_stdout()
@@ -297,7 +297,10 @@ pub fn wait_for_child(child: std::sync::Arc<SharedChild>) -> Result<(), String> 
                     .map(|mut s| s.read_to_string(&mut stderr).ok());
                 Err(stderr)
             }
-        },
-        Err(_) => Err(gettext("Unknown IO error happened")),
+        }
+        Err(err) => {
+            error!("IO error happened: {err}");
+            Err(gettext("Unknown IO error happened"))
+        }
     }
 }

@@ -1,7 +1,6 @@
 use adw::prelude::*;
 use glib::{SignalHandlerId, Value};
 use gtk::{gdk::Texture, gio, glib, subclass::prelude::*};
-use once_cell::sync::Lazy;
 
 mod imp {
 
@@ -53,19 +52,20 @@ mod imp {
 
     impl ObjectImpl for ImageThumbnail {
         fn properties() -> &'static [ParamSpec] {
-            static PROPERTIES: Lazy<Vec<ParamSpec>> = Lazy::new(|| {
-                vec![
-                    ParamSpecObject::builder::<Texture>("image")
-                        .write_only()
-                        .build(),
-                    ParamSpecString::builder("content").write_only().build(),
-                    ParamSpecObject::builder::<gtk::Button>("remove")
-                        .read_only()
-                        .build(),
-                    ParamSpecUInt::builder("width").write_only().build(),
-                    ParamSpecUInt::builder("height").write_only().build(),
-                ]
-            });
+            static PROPERTIES: std::sync::LazyLock<Vec<ParamSpec>> =
+                std::sync::LazyLock::new(|| {
+                    vec![
+                        ParamSpecObject::builder::<Texture>("image")
+                            .write_only()
+                            .build(),
+                        ParamSpecString::builder("content").write_only().build(),
+                        ParamSpecObject::builder::<gtk::Button>("remove")
+                            .read_only()
+                            .build(),
+                        ParamSpecUInt::builder("width").write_only().build(),
+                        ParamSpecUInt::builder("height").write_only().build(),
+                    ]
+                });
             PROPERTIES.as_ref()
         }
 
@@ -75,17 +75,14 @@ mod imp {
                     let p = value
                         .get::<Option<&Texture>>()
                         .expect("Value must be a Pixbuf");
-                    match p {
-                        Some(p) => {
-                            self.picture.set_paintable(Some(p));
-                            self.picture.set_visible(true);
-                            self.image.set_visible(false);
-                        }
-                        None => {
-                            self.image.set_icon_name(Some("image-symbolic"));
-                            self.image.set_visible(true);
-                            self.picture.set_visible(false);
-                        }
+                    if let Some(p) = p {
+                        self.picture.set_paintable(Some(p));
+                        self.picture.set_visible(true);
+                        self.image.set_visible(false);
+                    } else {
+                        self.image.set_icon_name(Some("image-symbolic"));
+                        self.image.set_visible(true);
+                        self.picture.set_visible(false);
                     }
                 }
                 "content" => {
@@ -127,7 +124,7 @@ mod imp {
         }
 
         fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
-            self.root.allocate(width, height, baseline, None)
+            self.root.allocate(width, height, baseline, None);
         }
     }
 }

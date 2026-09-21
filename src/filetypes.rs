@@ -38,10 +38,12 @@ pub enum FileType {
     Unknown,
 }
 
-use FileType::*;
+use FileType::{
+    Avif, Bmp, Dds, Gif, Heic, Heif, Ico, Jpeg, Jpg, Jxl, Pdf, Png, Svg, Tiff, Unknown, Webp,
+};
 
 impl FileType {
-    pub fn is_input(&self) -> bool {
+    pub const fn is_input(self) -> bool {
         matches!(
             self,
             Png | Jpg
@@ -61,36 +63,36 @@ impl FileType {
         )
     }
 
-    pub fn supports_animation(&self) -> bool {
+    pub const fn supports_animation(self) -> bool {
         matches!(self, Webp | Gif | Heic | Heif)
     }
 
-    pub fn is_lossy(&self) -> bool {
+    pub const fn is_lossy(self) -> bool {
         matches!(
             self,
             Jpg | Jpeg | Webp | Heif | Heic | Avif | Jxl | Tiff | Pdf | Dds
         )
     }
 
-    pub fn supports_alpha(&self) -> bool {
+    pub const fn supports_alpha(self) -> bool {
         matches!(
             self,
             Png | Webp | Svg | Heif | Heic | Avif | Jxl | Pdf | Ico | Gif
         )
     }
 
-    pub fn supports_metadata(&self) -> bool {
+    pub const fn supports_metadata(self) -> bool {
         matches!(
             self,
             Png | Jpg | Jpeg | Jxl | Tiff | Pdf | Svg | Gif | Webp | Heif | Heic | Avif | Bmp
         )
     }
 
-    pub fn supports_pixbuf(&self) -> bool {
+    pub const fn supports_pixbuf(self) -> bool {
         !matches!(self, Pdf | Dds | Ico)
     }
 
-    pub fn is_output(&self) -> bool {
+    pub const fn is_output(self) -> bool {
         matches!(
             self,
             Png | Jpg | Jpeg | Webp | Heif | Heic | Bmp | Avif | Jxl | Tiff | Pdf | Gif | Ico | Dds
@@ -119,11 +121,10 @@ impl FileType {
         ALL_FILETYPES.iter()
     }
 
-    pub fn as_mime(&self) -> &'static str {
+    pub const fn as_mime(self) -> &'static str {
         match self {
             Png => "image/png",
-            Jpg => "image/jpeg",
-            Jpeg => "image/jpeg",
+            Jpg | Jpeg => "image/jpeg",
             Webp => "image/webp",
             Svg => "image/svg+xml",
             Heif => "image/heif",
@@ -143,8 +144,7 @@ impl FileType {
     pub fn from_mimetype(mimetype: &str) -> Option<Self> {
         match mimetype {
             "image/png" => Some(Png),
-            "image/jpeg" => Some(Jpg),
-            "image/jpg" => Some(Jpg),
+            "image/jpeg" | "image/jpg" => Some(Jpg),
             "image/webp" => Some(Webp),
             "image/svg+xml" => Some(Svg),
             "image/heif" => Some(Heif),
@@ -161,7 +161,7 @@ impl FileType {
         }
     }
 
-    pub fn as_extension(&self) -> &str {
+    pub const fn as_extension(&self) -> &str {
         match self {
             Png => "png",
             Jpg => "jpg",
@@ -182,15 +182,14 @@ impl FileType {
         }
     }
 
-    pub fn as_display_string(&self) -> String {
+    pub fn as_display_string(self) -> String {
         self.as_extension().to_uppercase()
     }
 
     pub fn from_string(extension: &str) -> Option<Self> {
         match extension {
             "png" => Some(Png),
-            "jpg" => Some(Jpg),
-            "jpeg" => Some(Jpg),
+            "jpg" | "jpeg" => Some(Jpg),
             "webp" => Some(Webp),
             "svg" => Some(Svg),
             "heif" => Some(Heif),
@@ -217,10 +216,10 @@ pub enum CompressionType {
     Directory,
 }
 
-use CompressionType::*;
+use CompressionType::{Directory, Zip};
 
 impl CompressionType {
-    pub fn is_compression(&self) -> bool {
+    pub const fn is_compression(self) -> bool {
         matches!(self, Zip)
     }
 
@@ -237,30 +236,31 @@ impl CompressionType {
     pub fn possible_output(sandboxed: bool) -> Iter<'static, Self> {
         static COMPRESSION_TYPES: [CompressionType; 1] = [Zip];
         static ALL_TYPES: [CompressionType; 2] = [Zip, Directory];
-        match sandboxed {
-            true => COMPRESSION_TYPES.iter(),
-            false => ALL_TYPES.iter(),
+        if sandboxed {
+            COMPRESSION_TYPES.iter()
+        } else {
+            ALL_TYPES.iter()
         }
     }
 
-    pub fn as_mime(&self) -> &'static str {
+    pub const fn as_mime(self) -> &'static str {
         match self {
             Zip => "application/zip",
             Directory => "inode/directory",
         }
     }
 
-    pub fn as_extension(&self) -> &str {
+    pub const fn as_extension(self) -> &'static str {
         match self {
             Zip => "zip",
             Directory => "directory",
         }
     }
 
-    pub fn as_display_string(&self) -> String {
+    pub const fn as_display_string(self) -> &'static str {
         match self {
-            Directory => "Directory".to_owned(),
-            x => x.as_extension().to_uppercase(),
+            Directory => "Directory",
+            Zip => "ZIP",
         }
     }
 
@@ -280,40 +280,39 @@ pub enum OutputType {
 }
 
 impl OutputType {
-    pub fn as_mime(&self) -> &'static str {
+    pub const fn as_mime(self) -> &'static str {
         match self {
-            OutputType::File(f) => f.as_mime(),
-            OutputType::Compression(f) => f.as_mime(),
+            Self::File(f) => f.as_mime(),
+            Self::Compression(f) => f.as_mime(),
         }
     }
 
     pub fn from_string(extension: &str) -> Option<Self> {
         match extension {
-            "zip" => Some(OutputType::Compression(Zip)),
-            "directory" => Some(OutputType::Compression(Directory)),
-            "png" => Some(OutputType::File(Png)),
-            "jpg" => Some(OutputType::File(Jpg)),
-            "jpeg" => Some(OutputType::File(Jpg)),
-            "webp" => Some(OutputType::File(Webp)),
-            "svg" => Some(OutputType::File(Svg)),
-            "heif" => Some(OutputType::File(Heif)),
-            "heic" => Some(OutputType::File(Heic)),
-            "bmp" => Some(OutputType::File(Bmp)),
-            "avif" => Some(OutputType::File(Avif)),
-            "jxl" => Some(OutputType::File(Jxl)),
-            "tiff" => Some(OutputType::File(Tiff)),
-            "pdf" => Some(OutputType::File(Pdf)),
-            "gif" => Some(OutputType::File(Gif)),
-            "ico" => Some(OutputType::File(Ico)),
-            "dds" => Some(OutputType::File(Dds)),
+            "zip" => Some(Self::Compression(Zip)),
+            "directory" => Some(Self::Compression(Directory)),
+            "png" => Some(Self::File(Png)),
+            "jpg" | "jpeg" => Some(Self::File(Jpg)),
+            "webp" => Some(Self::File(Webp)),
+            "svg" => Some(Self::File(Svg)),
+            "heif" => Some(Self::File(Heif)),
+            "heic" => Some(Self::File(Heic)),
+            "bmp" => Some(Self::File(Bmp)),
+            "avif" => Some(Self::File(Avif)),
+            "jxl" => Some(Self::File(Jxl)),
+            "tiff" => Some(Self::File(Tiff)),
+            "pdf" => Some(Self::File(Pdf)),
+            "gif" => Some(Self::File(Gif)),
+            "ico" => Some(Self::File(Ico)),
+            "dds" => Some(Self::File(Dds)),
             _ => None,
         }
     }
 
-    pub fn as_extension(&self) -> &str {
+    pub const fn as_extension(&self) -> &str {
         match self {
-            OutputType::File(f) => f.as_extension(),
-            OutputType::Compression(f) => f.as_extension(),
+            Self::File(f) => f.as_extension(),
+            Self::Compression(f) => f.as_extension(),
         }
     }
 }

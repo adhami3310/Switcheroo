@@ -12,7 +12,7 @@ pub fn create_temporary_dir() -> std::io::Result<TempDir> {
     }
 }
 
-pub fn get_temp_file_path(dir: &TempDir, identifer: JobFile) -> PathBuf {
+pub fn get_temp_file_path(dir: &TempDir, identifer: &JobFile) -> PathBuf {
     let dir_path = dir.path();
     dir_path.join(identifer.as_filename())
 }
