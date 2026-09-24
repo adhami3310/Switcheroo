@@ -1,14 +1,17 @@
+use crate::temp::get_temporary_file_path;
 use crate::{color::Color, filetypes::FileType, window::ResizeFilter, window::StripType};
 use gettextrs::gettext;
 use itertools::Itertools;
-use log::error;
 use shared_child::SharedChild;
+use std::ffi::OsStr;
 use std::io::Read;
 use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tempfile::TempDir;
 
-pub async fn count_frames(path: String) -> Result<(NonZeroUsize, Option<(usize, usize)>), ()> {
+pub async fn count_frames(path: &Path) -> Result<(NonZeroUsize, Option<(usize, usize)>), ()> {
     let output = tokio::process::Command::new("magick")
         .stdout(std::process::Stdio::piped())
         .arg("identify")
@@ -105,10 +108,47 @@ where
     }
 }
 
+#[derive(Debug)]
+pub struct IndividualConvertJob {
+    pub input_file: PathBuf,
+    pub input_file_type: FileType,
+    pub output_stem: String,
+}
+
+impl IndividualConvertJob {
+    pub fn get_magick_job(
+        self,
+        temporary_directory: &TempDir,
+        output_file_type: FileType,
+        pdf_dpi: usize,
+        magick_arguments: &DefaultMagickArguments,
+    ) -> MagickConvertJob {
+        generate_job(
+            self.input_file,
+            self.input_file_type,
+            get_temporary_file_path(
+                temporary_directory,
+                &JobFile::new(output_file_type, Some(self.output_stem)),
+            ),
+            output_file_type,
+            pdf_dpi,
+            magick_arguments,
+        )
+    }
+}
+
+pub struct DefaultMagickArguments {
+    pub background: Color,
+    pub quality: usize,
+    pub filter: Option<ResizeFilter>,
+    pub resize_arg: ResizeArgument,
+    pub strip: StripType,
+}
+
 #[derive(Debug, Clone)]
 pub struct MagickConvertJob {
-    pub input_file: String,
-    pub output_file: String,
+    pub input_file: PathBuf,
+    pub output_file: PathBuf,
     pub background: Color,
     pub quality: usize,
     pub first_frame: bool,
@@ -162,6 +202,28 @@ impl JobFile {
 }
 
 impl MagickConvertJob {
+    pub const fn from_default_arguments(
+        input_file: PathBuf,
+        output_file: PathBuf,
+        density: Option<usize>,
+        first_frame: bool,
+        remove_alpha: bool,
+        default_arguments: &DefaultMagickArguments,
+    ) -> Self {
+        Self {
+            input_file,
+            output_file,
+            background: default_arguments.background,
+            quality: default_arguments.quality,
+            first_frame,
+            filter: default_arguments.filter,
+            strip: default_arguments.strip,
+            resize_arg: default_arguments.resize_arg,
+            density,
+            remove_alpha,
+        }
+    }
+
     pub fn get_command(&self) -> Command {
         let mut command = Command::new("magick");
 
@@ -169,8 +231,8 @@ impl MagickConvertJob {
 
         let input_file_ext = self
             .input_file
-            .rsplit('.')
-            .next()
+            .extension()
+            .and_then(OsStr::to_str)
             .unwrap_or("")
             .split('[')
             .next()
@@ -244,63 +306,56 @@ impl MagickConvertJob {
     }
 }
 
-pub fn generate_job(
-    input_path: &str,
+pub const fn generate_job(
+    input_path: PathBuf,
     input_type: FileType,
-    output_path: &str,
+    output_path: PathBuf,
     output_type: FileType,
     pdf_dpi: usize,
-    default_arguments: &MagickConvertJob,
-) -> Vec<MagickConvertJob> {
-    use FileType::Pdf;
+    default_arguments: &DefaultMagickArguments,
+) -> MagickConvertJob {
     match (input_type, output_type) {
-        (Pdf, _) => std::iter::once(MagickConvertJob {
-            input_file: input_path.to_owned(),
-            output_file: output_path.to_owned(),
-            density: Some(pdf_dpi),
-            ..*default_arguments
-        })
-        .collect(),
+        (FileType::Pdf, _) => MagickConvertJob::from_default_arguments(
+            input_path,
+            output_path,
+            Some(pdf_dpi),
+            false,
+            false,
+            default_arguments,
+        ),
         (input, output) if input.supports_animation() && output.supports_animation() => {
-            std::iter::once(MagickConvertJob {
-                input_file: input_path.to_owned(),
-                output_file: output_path.to_owned(),
-                first_frame: false,
-                ..*default_arguments
-            })
-            .collect()
+            MagickConvertJob::from_default_arguments(
+                input_path,
+                output_path,
+                None,
+                false,
+                false,
+                default_arguments,
+            )
         }
-        (input, output) => std::iter::once(MagickConvertJob {
-            input_file: input_path.to_owned(),
-            output_file: output_path.to_owned(),
-            first_frame: true,
-            remove_alpha: !input.supports_alpha() && output.supports_alpha(),
-            ..*default_arguments
-        })
-        .collect(),
+        (input, output) => MagickConvertJob::from_default_arguments(
+            input_path,
+            output_path,
+            None,
+            true,
+            !input.supports_alpha() && output.supports_alpha(),
+            default_arguments,
+        ),
     }
 }
 
-pub fn wait_for_child(child: &std::sync::Arc<SharedChild>) -> Result<(), String> {
-    let command = child.wait();
-    match command {
-        Ok(output) => {
-            if output.success() {
-                Ok(())
-            } else {
-                let mut stderr = String::new();
-                child
-                    .take_stdout()
-                    .map(|mut s| s.read_to_string(&mut stderr).ok());
-                child
-                    .take_stderr()
-                    .map(|mut s| s.read_to_string(&mut stderr).ok());
-                Err(stderr)
-            }
-        }
-        Err(err) => {
-            error!("IO error happened: {err}");
-            Err(gettext("Unknown IO error happened"))
-        }
+pub fn wait_for_child(child: &std::sync::Arc<SharedChild>) -> Result<(), std::io::Error> {
+    let exit_status = child.wait()?;
+    if exit_status.success() {
+        Ok(())
+    } else {
+        let mut stderr = String::new();
+        child
+            .take_stdout()
+            .map(|mut s| s.read_to_string(&mut stderr).ok());
+        child
+            .take_stderr()
+            .map(|mut s| s.read_to_string(&mut stderr).ok());
+        Err(std::io::Error::other(stderr))
     }
 }

@@ -5,8 +5,11 @@ use gtk::{
     prelude::*,
     subclass::prelude::*,
 };
-use std::cell::{Cell, Ref, RefCell};
 use std::num::NonZeroUsize;
+use std::{
+    cell::{Cell, Ref, RefCell},
+    path::PathBuf,
+};
 
 use crate::filetypes::FileType;
 
@@ -17,7 +20,7 @@ mod imp {
     use super::*;
 
     pub struct InputFile {
-        pub path: RefCell<String>,
+        pub path: RefCell<PathBuf>,
         pub kind: Cell<FileType>,
         pub pixbuf: RefCell<Option<Texture>>,
         pub frame_count: Cell<NonZeroUsize>,
@@ -33,7 +36,7 @@ mod imp {
 
         fn new() -> Self {
             Self {
-                path: RefCell::new("/invalid-path".to_string()),
+                path: RefCell::new(PathBuf::from("/invalid-path")),
                 kind: Cell::new(FileType::Unknown),
                 pixbuf: RefCell::new(None),
                 frame_count: Cell::new(NonZeroUsize::MIN),
@@ -67,7 +70,7 @@ mod imp {
         fn set_property(&self, _id: usize, value: &Value, pspec: &ParamSpec) {
             match pspec.name() {
                 "path" => {
-                    let p = value.get::<String>().expect("Value must be a String");
+                    let p = value.get::<PathBuf>().expect("Value must be a PathBuf");
                     self.path.replace(p);
                 }
                 "kind" => {
@@ -126,7 +129,7 @@ impl InputFile {
 
         extension.map(|extension| {
             glib::Object::builder::<Self>()
-                .property("path", path.to_str().unwrap())
+                .property("path", &path)
                 .property("kind", extension)
                 .property("is-behind-sandbox", is_behind_sandbox)
                 .build()
@@ -179,8 +182,8 @@ impl InputFile {
         self.imp().pixbuf.replace(Some(p));
     }
 
-    pub fn path(&self) -> String {
-        self.imp().path.borrow().to_string()
+    pub fn path(&self) -> PathBuf {
+        self.imp().path.borrow().clone()
     }
 
     pub fn exists(&self) -> bool {

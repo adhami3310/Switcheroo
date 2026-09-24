@@ -123,11 +123,11 @@ impl FileChooser {
         parent: &AppWindow,
         default_name: String,
         format: OutputType,
-        default_folder: String,
+        default_folder: PathBuf,
         callback_success: A,
         callback_error: B,
     ) where
-        A: Fn(&AppWindow, OutputType, String) + 'static,
+        A: Fn(&AppWindow, OutputType, PathBuf) + 'static,
         B: Fn(&AppWindow, Option<&str>) + 'static,
     {
         glib::MainContext::default().spawn_local(clone!(
@@ -151,11 +151,11 @@ impl FileChooser {
         parent: &AppWindow,
         default_name: String,
         format: OutputType,
-        default_folder: Option<String>,
+        default_folder: Option<PathBuf>,
         callback_success: A,
         callback_error: B,
     ) where
-        A: Fn(&AppWindow, OutputType, String) + 'static,
+        A: Fn(&AppWindow, OutputType, PathBuf) + 'static,
         B: Fn(&AppWindow, Option<&str>) + 'static,
     {
         let image_filter = gtk::FileFilter::new();
@@ -193,16 +193,16 @@ impl FileChooser {
             return;
         }
 
-        callback_success(parent, format, file_path.to_str().unwrap().to_owned());
+        callback_success(parent, format, file_path);
     }
 
     pub fn choose_output_folder_wrapper<A, B>(
         parent: &AppWindow,
-        default_folder: String,
+        default_folder: PathBuf,
         callback_success: A,
         callback_error: B,
     ) where
-        A: Fn(&AppWindow, OutputType, String) + 'static,
+        A: Fn(&AppWindow, OutputType, PathBuf) + 'static,
         B: Fn(&AppWindow, Option<&str>) + 'static,
     {
         glib::MainContext::default().spawn_local(clone!(
@@ -222,11 +222,11 @@ impl FileChooser {
 
     pub async fn choose_output_folder<A, B>(
         parent: &AppWindow,
-        default_folder: Option<String>,
+        default_folder: Option<PathBuf>,
         callback_success: A,
         callback_error: B,
     ) where
-        A: Fn(&AppWindow, OutputType, String) + 'static,
+        A: Fn(&AppWindow, OutputType, PathBuf) + 'static,
         B: Fn(&AppWindow, Option<&str>) + 'static,
     {
         let dialog = gtk::FileDialog::builder().build();
@@ -245,7 +245,7 @@ impl FileChooser {
         callback_success(
             parent,
             OutputType::Compression(CompressionType::Directory),
-            file_path.to_str().unwrap().to_owned(),
+            file_path,
         );
     }
 }

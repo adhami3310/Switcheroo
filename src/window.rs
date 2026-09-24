@@ -1,7 +1,8 @@
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::os::fd::AsFd;
-use std::path::Path;
-use std::sync::atomic::AtomicUsize;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use crate::color::Color;
 use crate::config::APP_ID;
@@ -10,9 +11,10 @@ use crate::file_chooser::FileChooser;
 use crate::filetypes::{CompressionType, FileType, OutputType};
 use crate::input_file::InputFile;
 use crate::magick::{
-    JobFile, MagickConvertJob, ResizeArgument, count_frames, generate_job, wait_for_child,
+    DefaultMagickArguments, IndividualConvertJob, JobFile, MagickConvertJob, ResizeArgument,
+    count_frames, wait_for_child,
 };
-use crate::temp::{clean_dir, create_temporary_dir, get_temp_file_path};
+use crate::temp::{clean_dir, create_temporary_directory};
 use crate::widgets::about_window::SwitcherooAbout;
 use crate::widgets::image_rest::ImageRest;
 use crate::widgets::image_thumbnail::ImageThumbnail;
@@ -27,6 +29,7 @@ use gtk::{gdk, gio, glib, subclass::prelude::*};
 use itertools::Itertools;
 use shared_child::SharedChild;
 use std::sync::Arc;
+use tempfile::TempDir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeFilter {
@@ -34,9 +37,26 @@ pub enum ResizeFilter {
     Point,
 }
 
-enum ArcOrOptionError {
-    Child(Arc<SharedChild>),
-    OptionError(Option<String>),
+enum TaskThreadMessage {
+    InformOfChildProcess(Arc<SharedChild>),
+    TaskTerminated(Result<(), std::io::Error>),
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct StopSignal(Arc<AtomicBool>);
+
+impl StopSignal {
+    pub fn stop(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn reset(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 #[allow(dead_code)]
@@ -80,10 +100,7 @@ pub enum StripType {
 }
 
 mod imp {
-    use std::{
-        cell::{Cell, RefCell},
-        sync::atomic::AtomicBool,
-    };
+    use std::cell::{Cell, RefCell};
 
     use crate::config::PKGDATADIR;
 
@@ -186,8 +203,7 @@ mod imp {
         pub input_file_store: gio::ListStore,
         #[derivative(Default(value = "gio::Settings::new(APP_ID)"))]
         pub settings: gio::Settings,
-        #[derivative(Default(value = "std::sync::Arc::new(AtomicBool::new(true))"))]
-        pub is_canceled: std::sync::Arc<AtomicBool>,
+        pub cancel_signal: StopSignal,
         pub current_jobs: RefCell<Vec<Arc<SharedChild>>>,
         pub image_width: Cell<Option<u32>>,
         pub image_height: Cell<Option<u32>>,
@@ -203,6 +219,7 @@ mod imp {
 
         fn class_init(klass: &mut Self::Class) {
             Self::bind_template(klass);
+            klass.bind_template_instance_callbacks();
         }
 
         fn instance_init(obj: &glib::subclass::InitializingObject<Self>) {
@@ -236,7 +253,7 @@ mod imp {
                 dbg!("Failed to save window state, {}", &err);
             }
 
-            if self.is_canceled.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.cancel_signal.is_stopped() {
                 // Pass close request on to the parent
                 self.parent_close_request()
             } else {
@@ -265,8 +282,9 @@ impl AppWindow {
             .property("application", app)
             .build();
 
-        win.setup_callbacks();
+        win.setup_filters();
         win.setup_drop_target();
+        win.load_options();
 
         win
     }
@@ -335,158 +353,148 @@ impl AppWindow {
         ]);
     }
 
-    fn setup_callbacks(&self) {
-        //load imp
+    #[template_callback]
+    fn on_add_clicked(&self) {
+        self.add_dialog();
+    }
+
+    #[template_callback]
+    fn on_convert_clicked(&self) {
+        self.save_files();
+    }
+
+    #[template_callback]
+    fn on_cancel_clicked(&self) {
+        self.convert_cancel();
+    }
+
+    #[template_callback]
+    fn on_output_filetype_changed(&self) {
+        self.update_advanced_options();
+        self.update_compression_options();
+        self.update_resize();
+    }
+
+    #[template_callback]
+    fn on_single_pdf_changed(&self) {
+        self.update_compression_options();
+    }
+
+    #[template_callback]
+    fn on_resize_type_changed(&self) {
+        self.update_resize();
+    }
+
+    #[template_callback]
+    fn on_resize_width_changed(&self) {
+        self.update_height_from_width();
+    }
+
+    #[template_callback]
+    fn on_resize_height_changed(&self) {
+        self.update_width_from_height();
+    }
+
+    #[template_callback]
+    fn on_link_axis_clicked(&self) {
+        if self.imp().link_axis.is_active() && self.imp().link_axis.is_visible() {
+            self.imp().link_axis.set_icon_name("chain-link-symbolic");
+            let old_value = self
+                .imp()
+                .resize_scale_width_value
+                .text()
+                .as_str()
+                .to_owned();
+            let new_value = self
+                .imp()
+                .resize_scale_height_value
+                .text()
+                .as_str()
+                .to_owned();
+            if old_value != new_value && !new_value.is_empty() {
+                self.imp().resize_scale_width_value.set_text(&new_value);
+            }
+            self.update_width_from_height();
+        } else {
+            self.imp()
+                .link_axis
+                .set_icon_name("chain-link-loose-symbolic");
+        }
+    }
+
+    #[template_callback]
+    fn on_resize_scale_height_changed(&self) {
+        if self.imp().link_axis.is_active() && self.imp().link_axis.is_visible() {
+            let old_value = self
+                .imp()
+                .resize_scale_width_value
+                .text()
+                .as_str()
+                .to_owned();
+            let new_value = self
+                .imp()
+                .resize_scale_height_value
+                .text()
+                .as_str()
+                .to_owned();
+            if old_value != new_value && !new_value.is_empty() {
+                self.imp().resize_scale_width_value.set_text(&new_value);
+            }
+        }
+    }
+
+    #[template_callback]
+    fn on_resize_scale_width_changed(&self) {
+        if self.imp().link_axis.is_active() && self.imp().link_axis.is_visible() {
+            let old_value = self
+                .imp()
+                .resize_scale_height_value
+                .text()
+                .as_str()
+                .to_owned();
+            let new_value = self
+                .imp()
+                .resize_scale_width_value
+                .text()
+                .as_str()
+                .to_owned();
+            if old_value != new_value && !new_value.is_empty() {
+                self.imp().resize_scale_height_value.set_text(&new_value);
+            }
+        }
+    }
+
+    #[template_callback]
+    fn on_resize_filter_default_toggled(&self, button: &gtk::ToggleButton) {
+        if button.is_active() == self.imp().resize_filter_pixel.is_active() {
+            self.imp()
+                .resize_filter_pixel
+                .set_active(!button.is_active());
+        }
+    }
+
+    #[template_callback]
+    fn on_resize_filter_pixel_toggled(&self, button: &gtk::ToggleButton) {
+        if button.is_active() == self.imp().resize_filter_default.is_active() {
+            self.imp()
+                .resize_filter_default
+                .set_active(!button.is_active());
+        }
+    }
+
+    #[template_callback]
+    fn on_bgcolor_changed(button: &gtk::ColorDialogButton) {
+        let hex = Color::from(button.rgba()).as_hex_string();
+        button
+            .first_child()
+            .unwrap()
+            .update_property(&[Property::Label(
+                &gettext("New transparency layer color: {}").replace("{}", &hex),
+            )]);
+    }
+
+    fn setup_filters(&self) {
         let imp = self.imp();
-        imp.open_button.connect_clicked(clone!(
-            #[weak(rename_to=this)]
-            self,
-            move |_| {
-                this.add_dialog();
-            }
-        ));
-        imp.add_button.connect_clicked(clone!(
-            #[weak(rename_to=this)]
-            self,
-            move |_| {
-                this.add_dialog();
-            }
-        ));
-        imp.other_add_button.connect_clicked(clone!(
-            #[weak(rename_to=this)]
-            self,
-            move |_| {
-                this.add_dialog();
-            }
-        ));
-        imp.convert_button.connect_clicked(clone!(
-            #[weak(rename_to=this)]
-            self,
-            move |_| {
-                this.save_files();
-            }
-        ));
-        imp.cancel_button.connect_clicked(clone!(
-            #[weak(rename_to=this)]
-            self,
-            move |_| {
-                this.convert_cancel();
-            }
-        ));
-        imp.output_filetype.connect_selected_notify(clone!(
-            #[weak(rename_to=this)]
-            self,
-            move |_| {
-                this.update_advanced_options();
-                this.update_compression_options();
-                this.update_resize();
-            }
-        ));
-        imp.single_pdf_value.connect_state_notify(clone!(
-            #[weak(rename_to=this)]
-            self,
-            move |_| {
-                this.update_compression_options();
-            }
-        ));
-        imp.resize_type.connect_selected_notify(clone!(
-            #[weak(rename_to=this)]
-            self,
-            move |_| {
-                this.update_resize();
-            }
-        ));
-        imp.resize_width_value.connect_changed(clone!(
-            #[weak(rename_to=this)]
-            self,
-            move |_| {
-                this.update_height_from_width();
-            }
-        ));
-        imp.resize_height_value.connect_changed(clone!(
-            #[weak(rename_to=this)]
-            self,
-            move |_| {
-                this.update_width_from_height();
-            }
-        ));
-        imp.link_axis.connect_clicked(clone!(
-            #[weak(rename_to=this)]
-            self,
-            move |_| {
-                if this.imp().link_axis.is_active() && this.imp().link_axis.is_visible() {
-                    this.imp().link_axis.set_icon_name("chain-link-symbolic");
-                    let old_value = this
-                        .imp()
-                        .resize_scale_width_value
-                        .text()
-                        .as_str()
-                        .to_owned();
-                    let new_value = this
-                        .imp()
-                        .resize_scale_height_value
-                        .text()
-                        .as_str()
-                        .to_owned();
-                    if old_value != new_value && !new_value.is_empty() {
-                        this.imp().resize_scale_width_value.set_text(&new_value);
-                    }
-                    this.update_width_from_height();
-                } else {
-                    this.imp()
-                        .link_axis
-                        .set_icon_name("chain-link-loose-symbolic");
-                }
-            }
-        ));
-
-        imp.resize_scale_height_value.connect_changed(clone!(
-            #[weak(rename_to=this)]
-            self,
-            move |_| {
-                if this.imp().link_axis.is_active() && this.imp().link_axis.is_visible() {
-                    let old_value = this
-                        .imp()
-                        .resize_scale_width_value
-                        .text()
-                        .as_str()
-                        .to_owned();
-                    let new_value = this
-                        .imp()
-                        .resize_scale_height_value
-                        .text()
-                        .as_str()
-                        .to_owned();
-                    if old_value != new_value && !new_value.is_empty() {
-                        this.imp().resize_scale_width_value.set_text(&new_value);
-                    }
-                }
-            }
-        ));
-
-        imp.resize_scale_width_value.connect_changed(clone!(
-            #[weak(rename_to=this)]
-            self,
-            move |_| {
-                if this.imp().link_axis.is_active() && this.imp().link_axis.is_visible() {
-                    let old_value = this
-                        .imp()
-                        .resize_scale_height_value
-                        .text()
-                        .as_str()
-                        .to_owned();
-                    let new_value = this
-                        .imp()
-                        .resize_scale_width_value
-                        .text()
-                        .as_str()
-                        .to_owned();
-                    if old_value != new_value && !new_value.is_empty() {
-                        this.imp().resize_scale_height_value.set_text(&new_value);
-                    }
-                }
-            }
-        ));
         imp.image_container.set_filter_func(clone!(
             #[weak(rename_to=this)]
             self,
@@ -504,31 +512,6 @@ impl AppWindow {
                 return !this.imp().removed.borrow().contains(&(f.index() as u32));
             }
         ));
-        imp.resize_filter_default.connect_toggled(clone!(
-            #[weak(rename_to=this)]
-            self,
-            move |f| {
-                if f.is_active() == this.imp().resize_filter_pixel.is_active() {
-                    this.imp().resize_filter_pixel.set_active(!f.is_active());
-                }
-            }
-        ));
-        imp.resize_filter_pixel.connect_toggled(clone!(
-            #[weak(rename_to=this)]
-            self,
-            move |f| {
-                if f.is_active() == this.imp().resize_filter_default.is_active() {
-                    this.imp().resize_filter_default.set_active(!f.is_active());
-                }
-            }
-        ));
-        imp.bgcolor.connect_rgba_notify(move |x| {
-            let y = Color::from(x.rgba()).as_hex_string();
-            x.first_child().unwrap().update_property(&[Property::Label(
-                &gettext("New transparency layer color: {}").replace("{}", &y),
-            )]);
-        });
-        self.load_options();
     }
 
     fn setup_drop_target(&self) {
@@ -586,9 +569,7 @@ impl AppWindow {
                 self,
                 move |_, response_id| {
                     if response_id == "stop" {
-                        this.imp()
-                            .is_canceled
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        this.imp().cancel_signal.stop();
                         let mut current_jobs = this.imp().current_jobs.borrow_mut();
                         for x in current_jobs.iter() {
                             match x.kill() {
@@ -695,7 +676,7 @@ impl AppWindow {
         std::thread::spawn(move || {
             let jobs = file_paths
                 .into_iter()
-                .map(|f| async move { count_frames(f).await })
+                .map(|file_path| async move { count_frames(&file_path).await })
                 .collect_vec();
 
             let res = runtime().block_on(join_all(jobs));
@@ -930,13 +911,13 @@ impl AppWindow {
             runtime().block_on(join_all(file_paths_pixbuf));
         });
 
-        let completed = std::sync::Arc::new(AtomicUsize::new(0));
         let total = self.files_count();
 
         glib::spawn_future_local(clone!(
             #[weak(rename_to=this)]
             self,
             async move {
+                let mut completed = 0;
                 while let Ok((i, p)) = receiver.recv().await {
                     if let Some(Ok(p)) = p {
                         this.imp()
@@ -947,9 +928,8 @@ impl AppWindow {
                             .set_pixbuf(p);
                     }
                     glib::MainContext::default().iteration(true);
-                    let c = completed.clone();
-                    let x = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if x + 1 == total {
+                    completed += 1;
+                    if completed == total {
                         this.load_pixbuf_finished();
                         break;
                     }
@@ -958,241 +938,272 @@ impl AppWindow {
         ));
     }
 
-    fn convert_start(&self, save_format: OutputType, path: String) {
-        use FileType::Pdf;
-
+    fn prepare_ui_for_conversion_start(&self) {
         self.imp().convert_button.set_sensitive(false);
         self.imp().progress_bar.set_text(Some(&gettext("Loading…")));
         self.imp().progress_bar.set_fraction(0.0);
-        self.imp()
-            .is_canceled
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        self.imp().current_jobs.replace(vec![]);
-        self.save_options().ok();
+    }
+
+    fn save_conversion_options(&self) {
+        self.save_resolution_settings().ok();
         self.save_selected_output().ok();
         self.save_selected_compression().ok();
+    }
 
-        let output_type = self.selected_output().unwrap();
+    fn get_path_with_index(path: &Path, index: usize) -> PathBuf {
+        let mut original_file_name = path.file_name().unwrap().to_owned();
+        original_file_name.push(format!("[{index}]"));
+        path.with_file_name(original_file_name)
+    }
 
-        let files = self.active_files();
+    fn generate_input_output_pairing(
+        input_file: &InputFile,
+        output_stem: &str,
+        output_type: FileType,
+    ) -> Vec<IndividualConvertJob> {
+        let (path, input_file_type, frame_count) = (
+            input_file.path(),
+            input_file.kind(),
+            input_file.frame_count().get(),
+        );
+        match (input_file_type, output_type, frame_count) {
+            (FileType::Pdf, _, c) => (0..c)
+                .map(|f| IndividualConvertJob {
+                    input_file: Self::get_path_with_index(&path, f),
+                    input_file_type,
+                    output_stem: format!("{output_stem}[{f}].{}", output_type.as_extension()),
+                })
+                .collect_vec(),
+            (_, _, 1) => vec![IndividualConvertJob {
+                input_file: Self::get_path_with_index(&path, 0),
+                input_file_type,
+                output_stem: format!("{output_stem}.{}", output_type.as_extension()),
+            }],
+            (input, output, _) if input.supports_animation() && output.supports_animation() => {
+                vec![IndividualConvertJob {
+                    input_file: path,
+                    input_file_type,
+                    output_stem: format!("{output_stem}.{}", output_type.as_extension()),
+                }]
+            }
+            (input, _, count) if input.supports_animation() => (0..count)
+                .map(|f| IndividualConvertJob {
+                    input_file: Self::get_path_with_index(&path, f),
+                    input_file_type,
+                    output_stem: format!("{output_stem}[{f}].{}", output_type.as_extension()),
+                })
+                .collect_vec(),
+            _ => vec![IndividualConvertJob {
+                input_file: Self::get_path_with_index(&path, 0),
+                input_file_type,
+                output_stem: format!("{output_stem}.{}", output_type.as_extension()),
+            }],
+        }
+    }
 
-        let dir = create_temporary_dir().unwrap();
+    fn choose_output_stem(
+        chosen_output_stems: &HashSet<String>,
+        preferred_output_stem: String,
+    ) -> String {
+        if chosen_output_stems.contains(&preferred_output_stem) {
+            let mut i = 1;
+            while chosen_output_stems.contains(&format!("{preferred_output_stem}_{i}")) {
+                i += 1;
+            }
+            format!("{preferred_output_stem}_{i}")
+        } else {
+            preferred_output_stem
+        }
+    }
 
-        let job_input = files
+    fn generate_individual_convert_jobs(
+        input_files: Vec<InputFile>,
+        output_file_type: FileType,
+        temporary_directory: &TempDir,
+        pdf_dpi: usize,
+        magick_arguments: &DefaultMagickArguments,
+    ) -> Vec<MagickConvertJob> {
+        input_files
             .into_iter()
-            .map(|f| {
-                let stem = Path::new(&f.path())
+            .map(|input_file| {
+                let preferred_output_stem = input_file
+                    .path()
                     .file_stem()
                     .unwrap()
                     .to_str()
                     .unwrap()
                     .to_owned();
-                (f, stem)
+                (input_file, preferred_output_stem)
             })
-            .sorted_by_key(|(_, s)| s.to_owned())
-            .scan(HashSet::new(), |s, (f, stem)| {
-                let stem = if s.contains(&stem) {
-                    let mut i = 1;
-                    while s.contains(&format!("{stem}_{i}")) {
-                        i += 1;
-                    }
-                    format!("{stem}_{i}")
-                } else {
-                    stem
-                };
-                s.insert(stem.clone());
-                Some((f, stem))
-            })
+            .sorted_by_key(|(_, preferred_output_stem)| preferred_output_stem.to_owned())
+            .scan(
+                HashSet::new(),
+                |chosen_output_stems, (input_file, preferred_output_stem)| {
+                    let chosen_output_stem =
+                        Self::choose_output_stem(chosen_output_stems, preferred_output_stem);
+                    chosen_output_stems.insert(chosen_output_stem.clone());
+
+                    Some((input_file, chosen_output_stem))
+                },
+            )
             .flat_map(|(f, output_stem)| {
-                let (path, input_filetype, frame_count) =
-                    (f.path(), f.kind(), f.frame_count().get());
-                match (input_filetype, output_type, frame_count) {
-                    (Pdf, _, c) => (0..c)
-                        .map(|f| {
-                            (
-                                format!("{path}[{f}]"),
-                                input_filetype,
-                                format!("{output_stem}[{f}].{}", output_type.as_extension()),
-                            )
-                        })
-                        .collect_vec(),
-                    (_, _, 1) => vec![(
-                        format!("{path}[0]"),
-                        input_filetype,
-                        format!("{output_stem}.{}", output_type.as_extension()),
-                    )],
-                    (input, output, _)
-                        if input.supports_animation() && output.supports_animation() =>
-                    {
-                        vec![(
-                            path,
-                            input_filetype,
-                            format!("{output_stem}.{}", output_type.as_extension()),
-                        )]
-                    }
-                    (input, _, count) if input.supports_animation() => (0..count)
-                        .map(|f| {
-                            (
-                                format!("{path}[{f}]"),
-                                input_filetype,
-                                format!("{output_stem}[{f}].{}", output_type.as_extension()),
-                            )
-                        })
-                        .collect_vec(),
-                    _ => vec![(
-                        format!("{path}[0]"),
-                        input_filetype,
-                        format!("{output_stem}.{}", output_type.as_extension()),
-                    )],
-                }
+                Self::generate_input_output_pairing(&f, &output_stem, output_file_type)
             })
-            .collect_vec();
-
-        dbg!(&job_input);
-
-        let output_files = job_input
-            .iter()
-            .map(|(_, _, o)| {
-                get_temp_file_path(&dir, &JobFile::new(output_type, Some(o.clone())))
-                    .to_str()
-                    .unwrap()
-                    .to_owned()
+            .map(|job| {
+                job.get_magick_job(
+                    temporary_directory,
+                    output_file_type,
+                    pdf_dpi,
+                    magick_arguments,
+                )
             })
-            .collect_vec();
+            .collect_vec()
+    }
 
-        dbg!(&output_files);
+    fn wrap_shared_child_with_signal<F>(
+        sender: &async_channel::Sender<TaskThreadMessage>,
+        stop_flag: &StopSignal,
+        shared_child_factory: F,
+    ) where
+        F: FnOnce() -> Result<SharedChild, std::io::Error>,
+    {
+        let shared_child = match shared_child_factory() {
+            std::io::Result::Ok(shared_child) => shared_child,
+            std::io::Result::Err(e) => {
+                sender
+                    .send_blocking(TaskThreadMessage::TaskTerminated(Err(e)))
+                    .expect("Concurrency Issues");
+                return;
+            }
+        };
 
-        let magick_arguments = MagickConvertJob {
-            input_file: String::new(),
-            output_file: String::new(),
+        if stop_flag.is_stopped() {
+            return;
+        }
+
+        let child_arc = std::sync::Arc::new(shared_child);
+        sender
+            .send_blocking(TaskThreadMessage::InformOfChildProcess(child_arc.clone()))
+            .expect("Concurrency Issues");
+        let output = wait_for_child(&child_arc);
+
+        if stop_flag.is_stopped() {
+            return;
+        }
+
+        sender
+            .send_blocking(TaskThreadMessage::TaskTerminated(output))
+            .expect("Concurrency Issues");
+    }
+
+    fn run_jobs_in_tokio_runtime<J: FnOnce() + Send + 'static>(jobs: Vec<J>) {
+        std::thread::spawn(move || {
+            let handles = jobs
+                .into_iter()
+                .map(|job| runtime().spawn_blocking(job))
+                .collect_vec();
+
+            runtime().block_on(join_all(handles));
+        });
+    }
+
+    fn convert_start(&self, save_format: OutputType, path: PathBuf) {
+        self.prepare_ui_for_conversion_start();
+        self.imp().cancel_signal.reset();
+        self.imp().current_jobs.replace(vec![]);
+        self.save_conversion_options();
+
+        let output_file_type = self.selected_output().unwrap();
+
+        let input_files = self.active_files();
+
+        let temporary_directory = create_temporary_directory().unwrap();
+
+        let magick_arguments = DefaultMagickArguments {
             background: self.get_bgcolor_argument(),
             quality: self.get_quality_argument(),
             filter: self.get_filter_argument(),
             resize_arg: self.get_resize_argument(),
             strip: self.get_strip_argument(),
-            density: None,
-            first_frame: false,
-            remove_alpha: false,
         };
 
-        let magick_jobs = job_input
-            .into_iter()
-            .map(|(f, ft, os)| {
-                generate_job(
-                    &f,
-                    ft,
-                    get_temp_file_path(&dir, &JobFile::new(output_type, Some(os)))
-                        .to_str()
-                        .unwrap(),
-                    output_type,
-                    self.get_dpi_argument(),
-                    &magick_arguments,
-                )
-            })
+        let magick_jobs = Self::generate_individual_convert_jobs(
+            input_files,
+            output_file_type,
+            &temporary_directory,
+            self.get_dpi_argument(),
+            &magick_arguments,
+        );
+
+        let total_job_count = magick_jobs.len();
+
+        let output_files = magick_jobs
+            .iter()
+            .map(|job| job.output_file.clone())
             .collect_vec();
 
         let (sender, receiver) = async_channel::bounded(1);
 
-        let count = magick_jobs.iter().map(std::vec::Vec::len).sum();
+        let stop_flag = self.imp().cancel_signal.clone();
 
-        let completed = std::sync::Arc::new(AtomicUsize::new(0));
-
-        let stop_flag = self.imp().is_canceled.clone();
-        let stop_flag_s = stop_flag.clone();
-
-        std::thread::spawn(move || {
-            let stop_flag = stop_flag_s.clone();
-
-            let jobs = magick_jobs
+        Self::run_jobs_in_tokio_runtime(
+            magick_jobs
                 .into_iter()
-                .map(|mjs| {
+                .map(|job| {
                     let stop_flag = stop_flag.clone();
                     let sender = sender.clone();
-                    runtime().spawn_blocking(move || {
-                        for mut mj_command in mjs.into_iter().map(|mj| mj.get_command()) {
-                            if stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                                return;
-                            }
-
-                            let mj_command_str =
-                                mj_command.get_program().to_str().unwrap().to_string();
-
-                            let shared_child = match SharedChild::spawn(&mut mj_command) {
-                                std::io::Result::Ok(shared_child) => shared_child,
-                                std::io::Result::Err(e) => {
-                                    sender
-                                        .send_blocking(ArcOrOptionError::OptionError(Some(
-                                            mj_command_str + ": " + &e.to_string(),
-                                        )))
-                                        .expect("Concurrency Issues");
-                                    return;
-                                }
-                            };
-
-                            if stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                                return;
-                            }
-                            let child_arc = std::sync::Arc::new(shared_child);
-                            sender
-                                .send_blocking(ArcOrOptionError::Child(child_arc.clone()))
-                                .expect("Concurrency Issues");
-                            let output = wait_for_child(&child_arc).err();
-                            if stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                                return;
-                            }
-
-                            sender
-                                .send_blocking(ArcOrOptionError::OptionError(output))
-                                .expect("Concurrency Issues");
+                    move || {
+                        let mut magick_command = job.get_command();
+                        if stop_flag.is_stopped() {
+                            return;
                         }
-                    })
+
+                        Self::wrap_shared_child_with_signal(&sender, &stop_flag, move || {
+                            SharedChild::spawn(&mut magick_command)
+                        });
+                    }
                 })
-                .collect_vec();
+                .collect_vec(),
+        );
 
-            runtime().block_on(join_all(jobs));
-        });
-
-        let dir_path = dir.path().to_str().unwrap().to_string();
-
-        std::mem::forget(dir);
-
-        let stop_flag_r = stop_flag;
+        let dir_path = TempDir::keep(temporary_directory);
 
         glib::spawn_future_local(clone!(
             #[weak(rename_to=this)]
             self,
             async move {
-                while let Ok(e) = receiver.recv().await {
-                    match e {
-                        ArcOrOptionError::Child(c) => {
-                            if stop_flag_r.load(std::sync::atomic::Ordering::SeqCst) {
-                                match c.kill() {
+                let mut completed_count = 0;
+
+                while let Ok(task_thread_message) = receiver.recv().await {
+                    match task_thread_message {
+                        TaskThreadMessage::InformOfChildProcess(child_process) => {
+                            if stop_flag.is_stopped() {
+                                match child_process.kill() {
                                     Ok(()) => {}
                                     Err(_) => {
-                                        c.wait().ok();
+                                        child_process.wait().ok();
                                     }
                                 }
                             } else {
-                                this.imp().current_jobs.borrow_mut().push(c);
+                                this.imp().current_jobs.borrow_mut().push(child_process);
                             }
                         }
-                        ArcOrOptionError::OptionError(e) => {
-                            if let Some(e) = e {
-                                this.convert_failed(e, dir_path.clone());
-                                break;
-                            }
-                            let c = completed.clone();
-                            let x = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            this.set_convert_progress(x + 1, count);
-                            if x + 1 == count {
+                        TaskThreadMessage::TaskTerminated(Ok(())) => {
+                            completed_count += 1;
+                            this.set_convert_progress(completed_count, total_job_count);
+                            if completed_count == total_job_count {
                                 this.move_output(
                                     save_format,
                                     path.clone(),
-                                    output_files.clone(),
-                                    dir_path.clone(),
+                                    &output_files,
+                                    dir_path,
                                 );
                                 break;
                             }
+                        }
+                        TaskThreadMessage::TaskTerminated(Err(err)) => {
+                            this.convert_failed(err.to_string(), dir_path.clone());
+                            break;
                         }
                     }
                 }
@@ -1200,6 +1211,71 @@ impl AppWindow {
         ));
 
         self.switch_to_stack_converting();
+    }
+
+    fn combine_files<P: AsRef<OsStr>, Q: AsRef<OsStr>>(
+        files: &[P],
+        output_path: &Q,
+    ) -> Result<SharedChild, std::io::Error> {
+        SharedChild::spawn(
+            std::process::Command::new("magick")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .args(files)
+                .arg(output_path),
+        )
+    }
+
+    fn zip_files<P: AsRef<OsStr>, Q: AsRef<OsStr>>(
+        files: &[P],
+        output_path: &Q,
+    ) -> Result<SharedChild, std::io::Error> {
+        SharedChild::spawn(
+            std::process::Command::new(ZIP_BINARY_NAME)
+                .arg("-jFSm0")
+                .arg(output_path)
+                .args(files)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+        )
+    }
+
+    fn wrap_io_action_in_thread<F>(sender: async_channel::Sender<TaskThreadMessage>, action: F)
+    where
+        F: FnOnce() -> Result<(), std::io::Error> + Send + 'static,
+    {
+        std::thread::spawn(move || {
+            sender
+                .send_blocking(TaskThreadMessage::TaskTerminated(action()))
+                .expect("Concurrency Issues");
+        });
+    }
+
+    fn wrap_shared_child<F>(
+        sender: async_channel::Sender<TaskThreadMessage>,
+        shared_child_factory: F,
+    ) where
+        F: FnOnce() -> Result<SharedChild, std::io::Error> + Send + 'static,
+    {
+        std::thread::spawn(move || match shared_child_factory() {
+            Ok(shared_child) => {
+                let child_arc = std::sync::Arc::new(shared_child);
+                sender
+                    .send_blocking(TaskThreadMessage::InformOfChildProcess(child_arc.clone()))
+                    .expect("Concurrency Issues");
+
+                sender
+                    .send_blocking(TaskThreadMessage::TaskTerminated(wait_for_child(
+                        &child_arc,
+                    )))
+                    .expect("Concurrency Issues");
+            }
+            Err(err) => {
+                sender
+                    .send_blocking(TaskThreadMessage::TaskTerminated(Err(err)))
+                    .expect("Concurrency Issues");
+            }
+        });
     }
 }
 
@@ -1244,24 +1320,24 @@ trait ConvertArguments {
     fn get_strip_argument(&self) -> StripType;
 }
 trait ConvertOperations {
-    fn convert_start_wrapper(&self, save_format: OutputType, path: String);
+    fn convert_start_wrapper(&self, save_format: OutputType, path: PathBuf);
     fn move_output(
         &self,
         save_format: OutputType,
-        path: String,
-        output_files: Vec<String>,
-        dir_path: String,
+        path: PathBuf,
+        output_files: &[PathBuf],
+        dir_path: PathBuf,
     );
-    fn convert_failed(&self, error_message: String, temp_dir_path: String);
-    fn convert_success(&self, temp_dir_path: String, path: String, save_format: OutputType);
-    fn convert_clean(&self, temp_dir_path: String);
+    fn convert_failed(&self, error_message: String, temp_dir_path: PathBuf);
+    fn convert_success(&self, temp_dir_path: PathBuf, path: PathBuf, save_format: OutputType);
+    fn convert_clean(&self, temp_dir_path: PathBuf);
     fn convert_cancel(&self);
 }
 
 trait SettingsStore {
     fn save_window_size(&self) -> Result<(), glib::BoolError>;
     fn load_window_size(&self);
-    fn save_options(&self) -> Result<(), glib::BoolError>;
+    fn save_resolution_settings(&self) -> Result<(), glib::BoolError>;
     fn load_options(&self);
     fn save_selected_output(&self) -> Result<(), glib::BoolError>;
     fn load_selected_output(&self) -> FileType;
@@ -1270,171 +1346,76 @@ trait SettingsStore {
 }
 
 impl ConvertOperations for AppWindow {
-    fn convert_start_wrapper(&self, save_format: OutputType, path: String) {
+    fn convert_start_wrapper(&self, save_format: OutputType, path: PathBuf) {
         self.convert_start(save_format, path);
     }
 
     fn move_output(
         &self,
         save_format: OutputType,
-        path: String,
-        output_files: Vec<String>,
-        dir_path: String,
+        path: PathBuf,
+        output_files: &[PathBuf],
+        dir_path: PathBuf,
     ) {
-        let stop_flag = self.imp().is_canceled.clone();
-        if stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
+        let stop_flag = self.imp().cancel_signal.clone();
+        if stop_flag.is_stopped() {
             return;
         }
 
         let path_r = path.clone();
 
         self.set_collecting_progress();
-        let receiver = match save_format {
+        let (sender, receiver) = async_channel::bounded(1);
+        match save_format {
             OutputType::File(FileType::Pdf) if output_files.len() > 1 => {
-                let (sender, receiver) = async_channel::bounded(1);
-
-                std::thread::spawn(move || {
-                    let shared_child: SharedChild = match SharedChild::spawn(
-                        std::process::Command::new("magick")
-                            .stdout(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::piped())
-                            .args(output_files)
-                            .arg(path),
-                    ) {
-                        Ok(shared_child) => shared_child,
-                        Err(e) => {
-                            sender
-                                .send_blocking(ArcOrOptionError::OptionError(Some(
-                                    "magick: ".to_string() + &e.to_string(),
-                                )))
-                                .expect("Concurrency Issues");
-                            return;
-                        }
-                    };
-                    let child_arc = std::sync::Arc::new(shared_child);
-
-                    sender
-                        .send_blocking(ArcOrOptionError::Child(child_arc.clone()))
-                        .expect("Concurrency Issues");
-
-                    sender
-                        .send_blocking(ArcOrOptionError::OptionError(
-                            wait_for_child(&child_arc).err(),
-                        ))
-                        .expect("Concurrency Issues");
+                let cloned_output_files = output_files.to_owned();
+                Self::wrap_shared_child(sender, move || {
+                    Self::combine_files(&cloned_output_files, &path)
                 });
-
-                receiver
             }
             OutputType::File(_) => {
                 let file = output_files.first().unwrap().to_owned();
 
-                let (sender, receiver) = async_channel::bounded(1);
-
-                std::thread::spawn(move || {
-                    let error = move_file(file.as_ref(), path.as_ref())
-                        .err()
-                        .map(|e| format!("move: {e}"));
-
-                    sender
-                        .send_blocking(ArcOrOptionError::OptionError(error))
-                        .expect("Concurrency Issues");
-                });
-
-                receiver
+                Self::wrap_io_action_in_thread(sender, move || move_file(&file, &path));
             }
             OutputType::Compression(CompressionType::Directory) => {
-                let (sender, receiver) = async_channel::bounded(1);
-
-                std::thread::spawn(move || {
-                    let dest = std::path::Path::new(&path);
-                    let error = output_files
-                        .iter()
-                        .try_for_each(|file| {
-                            let from = std::path::Path::new(file);
-                            move_file(from, &dest.join(from.file_name().unwrap()))
-                        })
-                        .err()
-                        .map(|e| format!("move: {e}"));
-
-                    sender
-                        .send_blocking(ArcOrOptionError::OptionError(error))
-                        .expect("Concurrency Issues");
+                let cloned_output_files = output_files.to_owned();
+                Self::wrap_io_action_in_thread(sender, move || {
+                    move_files(&cloned_output_files, &path)
                 });
-
-                receiver
             }
             OutputType::Compression(CompressionType::Zip) => {
-                let (sender, receiver) = async_channel::bounded(1);
-
-                std::thread::spawn(move || {
-                    let shared_child = match SharedChild::spawn(
-                        std::process::Command::new(ZIP_BINARY_NAME)
-                            .arg("-jFSm0")
-                            .arg(path)
-                            .args(output_files)
-                            .stdout(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::piped()),
-                    ) {
-                        Ok(shared_child) => shared_child,
-                        Err(e) => {
-                            sender
-                                .send_blocking(ArcOrOptionError::OptionError(Some(
-                                    ZIP_BINARY_NAME.to_string() + ": " + &e.to_string(),
-                                )))
-                                .expect("Concurrency Issues");
-                            return;
-                        }
-                    };
-
-                    let child_arc = std::sync::Arc::new(shared_child);
-
-                    sender
-                        .send_blocking(ArcOrOptionError::Child(child_arc.clone()))
-                        .expect("Concurrency Issues");
-
-                    sender
-                        .send_blocking(ArcOrOptionError::OptionError(
-                            wait_for_child(&child_arc).err(),
-                        ))
-                        .expect("Concurrency Issues");
+                let cloned_output_files = output_files.to_owned();
+                Self::wrap_shared_child(sender, move || {
+                    Self::zip_files(&cloned_output_files, &path)
                 });
-
-                receiver
             }
-        };
+        }
 
         glib::spawn_future_local(clone!(
             #[weak(rename_to=this)]
             self,
             async move {
-                while let Ok(x) = receiver.recv().await {
-                    match x {
-                        ArcOrOptionError::Child(c) => {
-                            if this
-                                .imp()
-                                .is_canceled
-                                .load(std::sync::atomic::Ordering::SeqCst)
-                            {
-                                match c.kill() {
+                while let Ok(message) = receiver.recv().await {
+                    match message {
+                        TaskThreadMessage::InformOfChildProcess(child_process) => {
+                            if this.imp().cancel_signal.is_stopped() {
+                                match child_process.kill() {
                                     Ok(()) => {}
                                     Err(_) => {
-                                        c.wait().ok();
+                                        child_process.wait().ok();
                                     }
                                 }
                             } else {
-                                this.imp().current_jobs.borrow_mut().push(c);
+                                this.imp().current_jobs.borrow_mut().push(child_process);
                             }
                         }
-                        ArcOrOptionError::OptionError(x) => {
-                            match x {
-                                Some(e) => this.convert_failed(e, dir_path.clone()),
-                                None => this.convert_success(
-                                    dir_path.clone(),
-                                    path_r.clone(),
-                                    save_format,
-                                ),
-                            }
+                        TaskThreadMessage::TaskTerminated(Ok(())) => {
+                            this.convert_success(dir_path.clone(), path_r.clone(), save_format);
+                            break;
+                        }
+                        TaskThreadMessage::TaskTerminated(Err(err)) => {
+                            this.convert_failed(err.to_string(), dir_path.clone());
                             break;
                         }
                     }
@@ -1443,19 +1424,13 @@ impl ConvertOperations for AppWindow {
         ));
     }
 
-    fn convert_failed(&self, error_message: String, temp_dir_path: String) {
+    fn convert_failed(&self, error_message: String, temp_dir_path: PathBuf) {
         self.convert_clean(temp_dir_path);
-        if self
-            .imp()
-            .is_canceled
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.imp().cancel_signal.is_stopped() {
             return;
         }
         let mut current_jobs = self.imp().current_jobs.borrow_mut();
-        self.imp()
-            .is_canceled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.imp().cancel_signal.stop();
         for x in current_jobs.iter() {
             match x.kill() {
                 Ok(()) => {}
@@ -1510,11 +1485,9 @@ impl ConvertOperations for AppWindow {
         self.switch_to_stack_convert();
     }
 
-    fn convert_success(&self, temp_dir_path: String, path: String, save_format: OutputType) {
+    fn convert_success(&self, temp_dir_path: PathBuf, path: PathBuf, save_format: OutputType) {
         self.convert_clean(temp_dir_path);
-        self.imp()
-            .is_canceled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.imp().cancel_signal.stop();
         let toast = adw::Toast::new(&gettext("Image converted"));
         toast.set_button_label(Some(&gettext("Open")));
         toast.connect_button_clicked(move |_| {
@@ -1541,7 +1514,7 @@ impl ConvertOperations for AppWindow {
         self.switch_to_stack_convert();
     }
 
-    fn convert_clean(&self, temp_dir_path: String) {
+    fn convert_clean(&self, temp_dir_path: PathBuf) {
         clean_dir(temp_dir_path);
         self.imp().convert_button.set_sensitive(true);
     }
@@ -1564,9 +1537,7 @@ impl ConvertOperations for AppWindow {
                 self,
                 move |_, response_id| {
                     if response_id == "stop" {
-                        this.imp()
-                            .is_canceled
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        this.imp().cancel_signal.stop();
                         let mut current_jobs = this.imp().current_jobs.borrow_mut();
                         for x in current_jobs.iter() {
                             match x.kill() {
@@ -2100,7 +2071,7 @@ impl SettingsStore for AppWindow {
         }
     }
 
-    fn save_options(&self) -> Result<(), glib::BoolError> {
+    fn save_resolution_settings(&self) -> Result<(), glib::BoolError> {
         let imp = self.imp();
 
         imp.settings
@@ -2193,7 +2164,7 @@ impl FileOperations for AppWindow {
                 > 1;
         let output_option = self.selected_output().unwrap();
         let first_file_path = files.first().unwrap().path();
-        let first_file_path = std::path::Path::new(&first_file_path);
+        let first_file_path = Path::new(&first_file_path);
         let (save_format, default_name) =
             if multiple_files || multiple_frames && !output_option.supports_animation() {
                 if matches!(output_option, FileType::Pdf) && self.imp().single_pdf_value.state() {
@@ -2215,12 +2186,7 @@ impl FileOperations for AppWindow {
                 (OutputType::File(output_option), file_stem)
             };
 
-        let default_folder = first_file_path
-            .parent()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
+        let default_folder = first_file_path.parent().unwrap().to_owned();
 
         if save_format == OutputType::Compression(CompressionType::Directory) {
             FileChooser::choose_output_folder_wrapper(
@@ -2269,13 +2235,18 @@ impl FileOperations for AppWindow {
 
 /// Move a file, falling back to copy + delete when source and destination live
 /// on different filesystems (where [`std::fs::rename`] fails with `EXDEV`).
-fn move_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+fn move_file<P: AsRef<Path>, Q: AsRef<Path>>(from: &P, to: &Q) -> std::io::Result<()> {
     if matches!(std::fs::rename(from, to), Ok(())) {
         Ok(())
     } else {
-        std::fs::copy(from, to)?;
-        std::fs::remove_file(from)
+        std::fs::copy(from.as_ref(), to.as_ref())?;
+        std::fs::remove_file(from.as_ref())
     }
+}
+
+fn move_files<P: AsRef<Path>, Q: AsRef<Path>>(from: &[P], to: &Q) -> std::io::Result<()> {
+    from.iter()
+        .try_for_each(|file| move_file(file, &to.as_ref().join(file.as_ref().file_name().unwrap())))
 }
 
 fn generate_width_from_height(height: u32, image_dim: (u32, u32)) -> u32 {

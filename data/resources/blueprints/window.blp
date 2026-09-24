@@ -27,6 +27,7 @@ template $AppWindow: Adw.ApplicationWindow {
                   icon-name: 'plus-large-symbolic';
                   tooltip-text: _("Add Images (Ctrl+O)");
                   visible: false;
+                  clicked => $on_add_clicked() swapped;
 
                   styles [
                     'flat',
@@ -69,6 +70,7 @@ template $AppWindow: Adw.ApplicationWindow {
                           halign: center;
                           label: _("_Open Images…");
                           use-underline: true;
+                          clicked => $on_add_clicked() swapped;
 
                           styles [
                             "suggested-action",
@@ -116,6 +118,7 @@ template $AppWindow: Adw.ApplicationWindow {
                           Adw.PreferencesGroup {
                             Adw.ComboRow output_filetype {
                               title: _("Export Format");
+                              notify::selected => $on_output_filetype_changed() swapped;
 
                               model: StringList supported_output_filetypes {};
 
@@ -129,6 +132,7 @@ template $AppWindow: Adw.ApplicationWindow {
                               Switch single_pdf_value {
                                 active: false;
                                 valign: center;
+                                notify::state => $on_single_pdf_changed() swapped;
                               }
                             }
 
@@ -174,6 +178,7 @@ template $AppWindow: Adw.ApplicationWindow {
                               ColorDialogButton bgcolor {
                                 valign: center;
                                 rgba: "#00000000";
+                                notify::rgba => $on_bgcolor_changed();
 
                                 dialog: ColorDialog {
                                   with-alpha: true;
@@ -205,6 +210,7 @@ template $AppWindow: Adw.ApplicationWindow {
                                   input-purpose: digits;
                                   max-width-chars: 8;
                                   hexpand: false;
+                                  changed => $on_resize_width_changed() swapped;
                                 }
 
                                 Entry resize_scale_width_value {
@@ -214,6 +220,7 @@ template $AppWindow: Adw.ApplicationWindow {
                                   tooltip-text: _("Width");
                                   max-width-chars: 8;
                                   hexpand: false;
+                                  changed => $on_resize_scale_width_changed() swapped;
                                 }
 
                                 ToggleButton link_axis {
@@ -221,6 +228,7 @@ template $AppWindow: Adw.ApplicationWindow {
                                   valign: center;
                                   icon-name: 'chain-link-symbolic';
                                   tooltip-text: _("Preserve aspect ratio");
+                                  clicked => $on_link_axis_clicked() swapped;
 
                                   styles [
                                     'raised',
@@ -236,6 +244,7 @@ template $AppWindow: Adw.ApplicationWindow {
                                   input-purpose: digits;
                                   max-width-chars: 8;
                                   hexpand: false;
+                                  changed => $on_resize_height_changed() swapped;
                                 }
 
                                 Entry resize_scale_height_value {
@@ -245,6 +254,7 @@ template $AppWindow: Adw.ApplicationWindow {
                                   input-purpose: digits;
                                   max-width-chars: 8;
                                   hexpand: false;
+                                  changed => $on_resize_scale_height_changed() swapped;
                                 }
                               }
 
@@ -252,6 +262,7 @@ template $AppWindow: Adw.ApplicationWindow {
                                 Box {
                                   DropDown resize_type {
                                     valign: center;
+                                    notify::selected => $on_resize_type_changed() swapped;
 
                                     accessibility {
                                       label: _("Choose between resizing with percentages or using exact pixels");
@@ -282,11 +293,13 @@ template $AppWindow: Adw.ApplicationWindow {
                                 ToggleButton resize_filter_default {
                                   active: true;
                                   label: _("Default");
+                                  toggled => $on_resize_filter_default_toggled() swapped;
                                 }
 
                                 ToggleButton resize_filter_pixel {
                                   active: false;
                                   label: _("Pixel Art");
+                                  toggled => $on_resize_filter_pixel_toggled() swapped;
                                 }
 
                                 styles [
@@ -315,6 +328,7 @@ template $AppWindow: Adw.ApplicationWindow {
                               halign: end;
                               label: _("_Convert");
                               use-underline: true;
+                              clicked => $on_convert_clicked() swapped;
 
                               styles [
                                 "suggested-action",
@@ -363,6 +377,7 @@ template $AppWindow: Adw.ApplicationWindow {
                           halign: center;
                           label: _("_Cancel");
                           use-underline: true;
+                          clicked => $on_cancel_clicked() swapped;
 
                           styles [
                             "destructive-action",
@@ -387,6 +402,7 @@ template $AppWindow: Adw.ApplicationWindow {
                 Button other_add_button {
                   icon-name: 'plus-large-symbolic';
                   tooltip-text: _("Add Images (Ctrl+O)");
+                  clicked => $on_add_clicked() swapped;
 
                   styles [
                     'flat',
