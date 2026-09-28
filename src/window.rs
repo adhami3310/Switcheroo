@@ -38,10 +38,16 @@ pub enum ResizeFilter {
 }
 
 enum TaskThreadMessage {
-    InformOfChildProcess(Arc<SharedChild>),
+    InformOfChildProcess {
+        run: StopSignal,
+        child: Arc<SharedChild>,
+    },
     TaskTerminated(Result<(), std::io::Error>),
 }
 
+/// Handle to a single conversion run, handed out to the worker threads that
+/// belong to it. Clones share one flag, and every run gets a fresh one, so the
+/// token of a run that has ended stays stopped forever.
 #[derive(Debug, Default, Clone)]
 pub struct StopSignal(Arc<AtomicBool>);
 
@@ -50,12 +56,86 @@ impl StopSignal {
         self.0.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    pub fn reset(&self) {
-        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-
     pub fn is_stopped(&self) -> bool {
         self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn is_same_run(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+fn kill_child(child: &SharedChild) {
+    if child.kill().is_err() {
+        child.wait().ok();
+    }
+}
+
+#[derive(Debug)]
+pub struct RunningConversion {
+    /// Shared with the worker threads of this run.
+    stop_signal: StopSignal,
+    /// Only ever touched from the main thread.
+    children: Vec<Arc<SharedChild>>,
+}
+
+#[derive(Debug, Default)]
+pub enum ConversionStatus {
+    #[default]
+    Idle,
+    InProgress(RunningConversion),
+}
+
+impl ConversionStatus {
+    /// Ends whatever was running and begins a new run, returning the token its
+    /// worker threads check for cancellation.
+    pub fn start(&mut self) -> StopSignal {
+        self.stop();
+
+        let stop_signal = StopSignal::default();
+        *self = Self::InProgress(RunningConversion {
+            stop_signal: stop_signal.clone(),
+            children: Vec::new(),
+        });
+        stop_signal
+    }
+
+    /// The token of the run in flight, if there is one.
+    pub fn stop_signal(&self) -> Option<StopSignal> {
+        match self {
+            Self::InProgress(run) => Some(run.stop_signal.clone()),
+            Self::Idle => None,
+        }
+    }
+
+    /// Takes ownership of a child process spawned by `run`. A child belonging
+    /// to a run that is no longer current is killed rather than adopted.
+    pub fn adopt_child(&mut self, run: &StopSignal, child: Arc<SharedChild>) {
+        match self {
+            Self::InProgress(current) if current.stop_signal.is_same_run(run) => {
+                current.children.push(child);
+            }
+            _ => kill_child(&child),
+        }
+    }
+
+    /// Ends the current run, killing anything still alive. Returns whether
+    /// there was a run to end.
+    pub fn stop(&mut self) -> bool {
+        let Self::InProgress(run) = self else {
+            return false;
+        };
+
+        run.stop_signal.stop();
+        for child in &run.children {
+            kill_child(child);
+        }
+        *self = Self::Idle;
+        true
+    }
+
+    pub const fn is_in_progress(&self) -> bool {
+        matches!(self, Self::InProgress(_))
     }
 }
 
@@ -203,8 +283,9 @@ mod imp {
         pub input_file_store: gio::ListStore,
         #[derivative(Default(value = "gio::Settings::new(APP_ID)"))]
         pub settings: gio::Settings,
-        pub cancel_signal: StopSignal,
-        pub current_jobs: RefCell<Vec<Arc<SharedChild>>>,
+
+        pub conversion_status: RefCell<ConversionStatus>,
+
         pub image_width: Cell<Option<u32>>,
         pub image_height: Cell<Option<u32>>,
         pub removed: RefCell<HashSet<u32>>,
@@ -253,12 +334,12 @@ mod imp {
                 dbg!("Failed to save window state, {}", &err);
             }
 
-            if self.cancel_signal.is_stopped() {
-                // Pass close request on to the parent
-                self.parent_close_request()
-            } else {
+            if self.conversion_status.borrow().is_in_progress() {
                 self.obj().close_dialog();
                 glib::Propagation::Stop
+            } else {
+                // Pass close request on to the parent
+                self.parent_close_request()
             }
         }
     }
@@ -569,17 +650,7 @@ impl AppWindow {
                 self,
                 move |_, response_id| {
                     if response_id == "stop" {
-                        this.imp().cancel_signal.stop();
-                        let mut current_jobs = this.imp().current_jobs.borrow_mut();
-                        for x in current_jobs.iter() {
-                            match x.kill() {
-                                Ok(()) => {}
-                                Err(_) => {
-                                    x.wait().ok();
-                                }
-                            }
-                        }
-                        current_jobs.clear();
+                        this.imp().conversion_status.borrow_mut().stop();
                         this.close();
                     }
                 }
@@ -1062,7 +1133,7 @@ impl AppWindow {
 
     fn wrap_shared_child_with_signal<F>(
         sender: &async_channel::Sender<TaskThreadMessage>,
-        stop_flag: &StopSignal,
+        run: &StopSignal,
         shared_child_factory: F,
     ) where
         F: FnOnce() -> Result<SharedChild, std::io::Error>,
@@ -1077,17 +1148,21 @@ impl AppWindow {
             }
         };
 
-        if stop_flag.is_stopped() {
+        if run.is_stopped() {
+            kill_child(&shared_child);
             return;
         }
 
         let child_arc = std::sync::Arc::new(shared_child);
         sender
-            .send_blocking(TaskThreadMessage::InformOfChildProcess(child_arc.clone()))
+            .send_blocking(TaskThreadMessage::InformOfChildProcess {
+                run: run.clone(),
+                child: child_arc.clone(),
+            })
             .expect("Concurrency Issues");
         let output = wait_for_child(&child_arc);
 
-        if stop_flag.is_stopped() {
+        if run.is_stopped() {
             return;
         }
 
@@ -1109,8 +1184,7 @@ impl AppWindow {
 
     fn convert_start(&self, save_format: OutputType, path: PathBuf) {
         self.prepare_ui_for_conversion_start();
-        self.imp().cancel_signal.reset();
-        self.imp().current_jobs.replace(vec![]);
+        let run = self.imp().conversion_status.borrow_mut().start();
         self.save_conversion_options();
 
         let output_file_type = self.selected_output().unwrap();
@@ -1144,21 +1218,19 @@ impl AppWindow {
 
         let (sender, receiver) = async_channel::bounded(1);
 
-        let stop_flag = self.imp().cancel_signal.clone();
-
         Self::run_jobs_in_tokio_runtime(
             magick_jobs
                 .into_iter()
                 .map(|job| {
-                    let stop_flag = stop_flag.clone();
+                    let run = run.clone();
                     let sender = sender.clone();
                     move || {
                         let mut magick_command = job.get_command();
-                        if stop_flag.is_stopped() {
+                        if run.is_stopped() {
                             return;
                         }
 
-                        Self::wrap_shared_child_with_signal(&sender, &stop_flag, move || {
+                        Self::wrap_shared_child_with_signal(&sender, &run, move || {
                             SharedChild::spawn(&mut magick_command)
                         });
                     }
@@ -1176,17 +1248,11 @@ impl AppWindow {
 
                 while let Ok(task_thread_message) = receiver.recv().await {
                     match task_thread_message {
-                        TaskThreadMessage::InformOfChildProcess(child_process) => {
-                            if stop_flag.is_stopped() {
-                                match child_process.kill() {
-                                    Ok(()) => {}
-                                    Err(_) => {
-                                        child_process.wait().ok();
-                                    }
-                                }
-                            } else {
-                                this.imp().current_jobs.borrow_mut().push(child_process);
-                            }
+                        TaskThreadMessage::InformOfChildProcess { run, child } => {
+                            this.imp()
+                                .conversion_status
+                                .borrow_mut()
+                                .adopt_child(&run, child);
                         }
                         TaskThreadMessage::TaskTerminated(Ok(())) => {
                             completed_count += 1;
@@ -1253,6 +1319,7 @@ impl AppWindow {
 
     fn wrap_shared_child<F>(
         sender: async_channel::Sender<TaskThreadMessage>,
+        run: StopSignal,
         shared_child_factory: F,
     ) where
         F: FnOnce() -> Result<SharedChild, std::io::Error> + Send + 'static,
@@ -1261,7 +1328,10 @@ impl AppWindow {
             Ok(shared_child) => {
                 let child_arc = std::sync::Arc::new(shared_child);
                 sender
-                    .send_blocking(TaskThreadMessage::InformOfChildProcess(child_arc.clone()))
+                    .send_blocking(TaskThreadMessage::InformOfChildProcess {
+                        run,
+                        child: child_arc.clone(),
+                    })
                     .expect("Concurrency Issues");
 
                 sender
@@ -1357,10 +1427,9 @@ impl ConvertOperations for AppWindow {
         output_files: &[PathBuf],
         dir_path: PathBuf,
     ) {
-        let stop_flag = self.imp().cancel_signal.clone();
-        if stop_flag.is_stopped() {
+        let Some(run) = self.imp().conversion_status.borrow().stop_signal() else {
             return;
-        }
+        };
 
         let path_r = path.clone();
 
@@ -1369,7 +1438,7 @@ impl ConvertOperations for AppWindow {
         match save_format {
             OutputType::File(FileType::Pdf) if output_files.len() > 1 => {
                 let cloned_output_files = output_files.to_owned();
-                Self::wrap_shared_child(sender, move || {
+                Self::wrap_shared_child(sender, run, move || {
                     Self::combine_files(&cloned_output_files, &path)
                 });
             }
@@ -1386,7 +1455,7 @@ impl ConvertOperations for AppWindow {
             }
             OutputType::Compression(CompressionType::Zip) => {
                 let cloned_output_files = output_files.to_owned();
-                Self::wrap_shared_child(sender, move || {
+                Self::wrap_shared_child(sender, run, move || {
                     Self::zip_files(&cloned_output_files, &path)
                 });
             }
@@ -1398,17 +1467,11 @@ impl ConvertOperations for AppWindow {
             async move {
                 while let Ok(message) = receiver.recv().await {
                     match message {
-                        TaskThreadMessage::InformOfChildProcess(child_process) => {
-                            if this.imp().cancel_signal.is_stopped() {
-                                match child_process.kill() {
-                                    Ok(()) => {}
-                                    Err(_) => {
-                                        child_process.wait().ok();
-                                    }
-                                }
-                            } else {
-                                this.imp().current_jobs.borrow_mut().push(child_process);
-                            }
+                        TaskThreadMessage::InformOfChildProcess { run, child } => {
+                            this.imp()
+                                .conversion_status
+                                .borrow_mut()
+                                .adopt_child(&run, child);
                         }
                         TaskThreadMessage::TaskTerminated(Ok(())) => {
                             this.convert_success(dir_path.clone(), path_r.clone(), save_format);
@@ -1426,20 +1489,10 @@ impl ConvertOperations for AppWindow {
 
     fn convert_failed(&self, error_message: String, temp_dir_path: PathBuf) {
         self.convert_clean(temp_dir_path);
-        if self.imp().cancel_signal.is_stopped() {
+
+        if !self.imp().conversion_status.borrow_mut().stop() {
             return;
         }
-        let mut current_jobs = self.imp().current_jobs.borrow_mut();
-        self.imp().cancel_signal.stop();
-        for x in current_jobs.iter() {
-            match x.kill() {
-                Ok(()) => {}
-                Err(_) => {
-                    x.wait().ok();
-                }
-            }
-        }
-        current_jobs.clear();
 
         let dialog = adw::AlertDialog::new(Some(&gettext("Error While Processing")), None);
 
@@ -1487,7 +1540,7 @@ impl ConvertOperations for AppWindow {
 
     fn convert_success(&self, temp_dir_path: PathBuf, path: PathBuf, save_format: OutputType) {
         self.convert_clean(temp_dir_path);
-        self.imp().cancel_signal.stop();
+        self.imp().conversion_status.borrow_mut().stop();
         let toast = adw::Toast::new(&gettext("Image converted"));
         toast.set_button_label(Some(&gettext("Open")));
         toast.connect_button_clicked(move |_| {
@@ -1537,17 +1590,7 @@ impl ConvertOperations for AppWindow {
                 self,
                 move |_, response_id| {
                     if response_id == "stop" {
-                        this.imp().cancel_signal.stop();
-                        let mut current_jobs = this.imp().current_jobs.borrow_mut();
-                        for x in current_jobs.iter() {
-                            match x.kill() {
-                                Ok(()) => {}
-                                Err(_) => {
-                                    x.wait().ok();
-                                }
-                            }
-                        }
-                        current_jobs.clear();
+                        this.imp().conversion_status.borrow_mut().stop();
                         this.switch_to_stack_convert();
                         this.show_toast(&gettext("Converting Cancelled"));
                     }
